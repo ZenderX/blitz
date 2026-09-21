@@ -26,7 +26,7 @@ use blitz_traits::net::{AbortSignal, DummyNetProvider, NetProvider, Request};
 use blitz_traits::node_id::NodeId;
 use blitz_traits::shell::{ColorScheme, DummyShellProvider, ShellProvider, Viewport};
 use cursor_icon::CursorIcon;
-use linebender_resource_handle::Blob;
+use linebender_resource_handle::{Blob, WeakBlob};
 use markup5ever::{LocalName, local_name};
 use parley::{FontContext, PlainEditorDriver};
 use selectors::{Element, matching::QuirksMode};
@@ -72,6 +72,9 @@ use web_time::Instant;
 
 #[cfg(feature = "parallel-construct")]
 use thread_local::ThreadLocal;
+
+#[cfg(feature = "svg")]
+use crate::node::{SvgImageData, SvgIntrinsicDimensions};
 
 pub enum DocGuard<'a> {
     Ref(&'a BaseDocument),
@@ -320,7 +323,7 @@ pub struct BaseDocument {
 
     /// Cache of loaded images, keyed by URL. Allows reusing images across multiple
     /// elements without re-fetching from the network.
-    pub(crate) image_cache: HashMap<String, ImageData>,
+    pub(crate) image_cache: ImageCache,
 
     /// Tracks in-flight image requests. When an image is being fetched, additional
     /// requests for the same URL are queued here instead of starting new fetches.
@@ -350,6 +353,110 @@ pub struct BaseDocument {
     /// it cancels all in-flight fetches tied to this document. Set via
     /// [`DocumentConfig::abort_signal`].
     pub(crate) abort_signal: Option<AbortSignal>,
+}
+
+/// Cache of loaded images, keyed by URL.
+///
+/// Entries are weak references to the decoded image data, so the cache does not
+/// itself keep an image alive: once the last node referencing it is gone, the
+/// data is freed and the entry is treated as a miss (the image is re-fetched if
+/// it is needed again). An upgraded entry keeps the [`Blob::id`] of the data it
+/// was created from, so renderers may continue to key resources on it.
+#[derive(Default)]
+pub(crate) struct ImageCache {
+    entries: HashMap<String, WeakImageData>,
+    /// Number of entries left after the last prune, used to amortize pruning.
+    live_at_last_prune: usize,
+}
+
+impl ImageCache {
+    /// The map size below which pruning is not worth the walk.
+    const MIN_PRUNE_LEN: usize = 16;
+
+    /// Look up an image by URL. A dead entry is removed and reported as a miss.
+    pub(crate) fn get(&mut self, url: &str) -> Option<ImageData> {
+        let image = self.entries.get(url)?.upgrade();
+        if image.is_none() {
+            self.entries.remove(url);
+        }
+        image
+    }
+
+    /// Cache an image, replacing any existing entry for the URL.
+    pub(crate) fn insert(&mut self, url: String, image: &ImageData) {
+        // Dead entries are otherwise only dropped when their URL is looked up
+        // again, so URLs that are never requested twice would accumulate. Prune
+        // once the map has doubled since the last prune, which keeps the total
+        // pruning work proportional to the number of insertions.
+        let prune_at = self
+            .live_at_last_prune
+            .saturating_mul(2)
+            .max(Self::MIN_PRUNE_LEN);
+        if self.entries.len() >= prune_at {
+            self.entries.retain(|_, entry| entry.upgrade().is_some());
+            self.live_at_last_prune = self.entries.len();
+        }
+
+        self.entries.insert(url, WeakImageData::downgrade(image));
+    }
+}
+
+/// A weak reference to the data of an [`ImageData`].
+enum WeakImageData {
+    Raster {
+        width: u32,
+        height: u32,
+        data: WeakBlob<u8>,
+    },
+    #[cfg(feature = "svg")]
+    Svg {
+        tree: std::sync::Weak<usvg::Tree>,
+        intrinsic_dimensions: SvgIntrinsicDimensions,
+    },
+    None,
+}
+
+impl WeakImageData {
+    /// Downgrade an image to a weak reference to its data.
+    fn downgrade(image: &ImageData) -> Self {
+        match image {
+            ImageData::Raster(data) => Self::Raster {
+                width: data.width,
+                height: data.height,
+                data: data.data.downgrade(),
+            },
+            #[cfg(feature = "svg")]
+            ImageData::Svg(data) => Self::Svg {
+                tree: Arc::downgrade(&data.tree),
+                intrinsic_dimensions: data.intrinsic_dimensions,
+            },
+            ImageData::None => Self::None,
+        }
+    }
+
+    /// Upgrade back to an image, unless its data has been dropped.
+    fn upgrade(&self) -> Option<ImageData> {
+        match self {
+            Self::Raster {
+                width,
+                height,
+                data,
+            } => Some(ImageData::Raster(RasterImageData {
+                width: *width,
+                height: *height,
+                data: data.upgrade()?,
+            })),
+            #[cfg(feature = "svg")]
+            Self::Svg {
+                tree,
+                intrinsic_dimensions,
+            } => Some(ImageData::Svg(SvgImageData {
+                tree: tree.upgrade()?,
+                intrinsic_dimensions: *intrinsic_dimensions,
+            })),
+            Self::None => Some(ImageData::None),
+        }
+    }
 }
 
 pub(crate) fn make_device(
@@ -496,7 +603,7 @@ impl BaseDocument {
 
             changed_nodes: HashSet::new(),
             deferred_construction_nodes: Vec::new(),
-            image_cache: HashMap::new(),
+            image_cache: ImageCache::default(),
             pending_images: HashMap::new(),
             pending_style_image_nodes: Vec::new(),
             pending_critical_resources: HashSet::new(),
@@ -1379,7 +1486,7 @@ impl BaseDocument {
         );
 
         // Cache the image
-        self.image_cache.insert(url.to_string(), image.clone());
+        self.image_cache.insert(url.to_string(), &image);
 
         // Apply to all waiting nodes
         for (node_id, image_type) in waiting_nodes {

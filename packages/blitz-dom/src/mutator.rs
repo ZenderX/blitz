@@ -1112,7 +1112,7 @@ impl<'doc> DocumentMutator<'doc> {
                     tracing::info!("Loading image {src_string} from cache");
                     let node = &mut self.doc.nodes[target_id];
                     node.element_data_mut().unwrap().special_data =
-                        SpecialElementData::Image(Box::new(cached_image.clone()));
+                        SpecialElementData::Image(Box::new(cached_image));
                     node.cache_mut().clear();
                     node.insert_damage(ALL_DAMAGE);
                     return;
