@@ -982,6 +982,9 @@ impl BaseDocument {
     /// it so that stale NodeIds are never dereferenced after the slot is freed.
     pub(crate) fn remove_node_from_tree(&mut self, node_id: NodeId) -> Option<Node> {
         self.clear_interaction_state_for_removed_node(node_id);
+        // NodeIds are never reused, so an id left here would be held for the document's lifetime.
+        self.changed_nodes.remove(&node_id);
+        self.controls_to_form.remove(&node_id);
         self.nodes.remove(node_id)
     }
 
@@ -3332,6 +3335,82 @@ mod font_face_override_tests {
             resolved_name, ALIAS,
             "registered family should report the CSS-declared name, \
              not the font file's internal `name` table entry",
+        );
+    }
+}
+
+#[cfg(test)]
+mod changed_nodes_tests {
+    use super::*;
+    use crate::qual_name;
+
+    /// A long-lived document that keeps creating and removing nodes must not
+    /// retain an entry per node it ever created: `changed_nodes` stays bounded
+    /// by the live nodes, or it grows without bound over days of uptime.
+    #[test]
+    fn changed_nodes_does_not_grow_across_create_remove_cycles() {
+        let mut doc = BaseDocument::new(DocumentConfig::default());
+        let root_id = doc.root_node().id;
+        let baseline = doc.changed_nodes.len();
+
+        for _ in 0..1000 {
+            let mut mutator = doc.mutate();
+            let div = mutator.create_element(qual_name!("div"), vec![]);
+            let text = mutator.create_text_node("row");
+            mutator.append_children(div, &[text]);
+            mutator.append_children(root_id, &[div]);
+            mutator.remove_and_drop_node(div);
+            let detached = mutator.create_text_node("never attached");
+            mutator.remove_node_if_unparented(detached);
+            drop(mutator);
+        }
+
+        assert_eq!(
+            doc.changed_nodes.len(),
+            baseline,
+            "every created-then-dropped node must leave changed_nodes"
+        );
+        assert!(
+            doc.changed_nodes.contains(&root_id),
+            "live nodes stay in changed_nodes, so has_changes keeps its meaning"
+        );
+    }
+
+    /// A page that keeps re-rendering a form must not retain a form-owner entry
+    /// per control it ever created: `controls_to_form` stays bounded by the
+    /// live controls.
+    #[test]
+    fn controls_to_form_does_not_grow_across_create_remove_cycles() {
+        let mut doc = BaseDocument::new(DocumentConfig::default());
+        let root_id = doc.root_node().id;
+        let form = {
+            let mut mutator = doc.mutate();
+            let form = mutator.create_element(qual_name!("form"), vec![]);
+            mutator.append_children(root_id, &[form]);
+            form
+        };
+
+        let mut last_input = None;
+        for _ in 0..1000 {
+            let mut mutator = doc.mutate();
+            if let Some(input) = last_input.take() {
+                mutator.remove_and_drop_node(input);
+            }
+            let input = mutator.create_element(qual_name!("input"), vec![]);
+            mutator.append_children(form, &[input]);
+            drop(mutator);
+            assert_eq!(
+                doc.controls_to_form.get(&input),
+                Some(&form),
+                "a control inserted into a form gets that form as its owner"
+            );
+            last_input = Some(input);
+        }
+
+        assert_eq!(
+            doc.controls_to_form.len(),
+            1,
+            "only the one live control may keep a form-owner entry"
         );
     }
 }
