@@ -1123,7 +1123,7 @@ impl BaseDocument {
 
     /// Whether the document has been mutated
     pub fn has_changes(&self) -> bool {
-        self.changed_nodes.is_empty()
+        !self.changed_nodes.is_empty()
     }
 
     pub fn create_text_node(&mut self, text: &str) -> NodeId {
@@ -3373,6 +3373,25 @@ mod changed_nodes_tests {
         assert!(
             doc.changed_nodes.contains(&root_id),
             "live nodes stay in changed_nodes, so has_changes keeps its meaning"
+        );
+    }
+
+    /// `has_changes` gates accessibility tree updates in blitz-shell, so it
+    /// must report true exactly when there are changed nodes to process.
+    #[test]
+    fn has_changes_reports_pending_changed_nodes() {
+        let mut doc = BaseDocument::new(DocumentConfig::default());
+        doc.changed_nodes.clear();
+        assert!(
+            !doc.has_changes(),
+            "a document with no changed nodes has no changes"
+        );
+
+        doc.mutate().create_text_node("new");
+
+        assert!(
+            doc.has_changes(),
+            "creating a node marks it changed, so the document has changes"
         );
     }
 
