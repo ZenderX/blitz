@@ -19,6 +19,7 @@ use style::{
     values::{CssUrl, SourceLocation},
 };
 
+use blitz_traits::net::http::{HeaderName, HeaderValue};
 use blitz_traits::net::{AbortSignal, Bytes, NetHandler, NetProvider, Request};
 use blitz_traits::shell::ShellProvider;
 
@@ -466,9 +467,15 @@ pub(crate) fn fetch_font_face(
                 });
 
             if let Some((url, format)) = preferred_source {
+                let mut request = stamped_request(url, abort_signal);
+                // Matches what browsers send, so net providers can tell font fetches apart.
+                request.headers.insert(
+                    HeaderName::from_static("sec-fetch-dest"),
+                    HeaderValue::from_static("font"),
+                );
                 network_provider.fetch(
                     doc_id,
-                    stamped_request(url, abort_signal),
+                    request,
                     ResourceHandler::boxed(
                         tx.clone(),
                         doc_id,
@@ -605,6 +612,54 @@ mod tests {
         assert_eq!(
             stylo_to_fontique_style(&oblique(10.0, 20.0)),
             Fq::Oblique(Some(10.0)),
+        );
+    }
+
+    struct RecordingNetProvider(std::sync::Mutex<Vec<Request>>);
+    impl NetProvider for RecordingNetProvider {
+        fn fetch(&self, _doc_id: usize, request: Request, _handler: Box<dyn NetHandler>) {
+            self.0.lock().unwrap().push(request);
+        }
+    }
+
+    /// Net providers rely on `Sec-Fetch-Dest: font` to recognise a font fetch
+    /// without guessing from the url's extension.
+    #[test]
+    fn font_face_request_is_marked_as_font_destination() {
+        let lock = SharedRwLock::new();
+        let sheet = Stylesheet::from_str(
+            "@font-face { font-family: Test; src: url(test.ttf); }",
+            Url::parse("https://example.com/style.css").unwrap().into(),
+            Origin::Author,
+            ServoArc::new(lock.wrap(MediaList::empty())),
+            lock.clone(),
+            None,
+            None,
+            QuirksMode::NoQuirks,
+            AllowImportRules::Yes,
+        );
+        let recorder = Arc::new(RecordingNetProvider(Default::default()));
+        let net_provider: Arc<dyn NetProvider> = recorder.clone();
+        let shell_provider: Arc<dyn ShellProvider> =
+            Arc::new(blitz_traits::shell::DummyShellProvider);
+        let (tx, _rx) = std::sync::mpsc::channel();
+
+        fetch_font_face(
+            tx,
+            0,
+            None,
+            &sheet,
+            &net_provider,
+            &shell_provider,
+            &lock.read(),
+            None,
+        );
+
+        let requests = recorder.0.lock().unwrap();
+        assert_eq!(requests.len(), 1, "one @font-face source yields one fetch");
+        assert_eq!(
+            requests[0].headers.get("sec-fetch-dest"),
+            Some(&HeaderValue::from_static("font")),
         );
     }
 }
