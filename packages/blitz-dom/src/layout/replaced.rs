@@ -1,7 +1,7 @@
 use markup5ever::{LocalName, local_name};
 use taffy::{
     AvailableSpace, BoxSizing, CoreStyle, LayoutInput, LayoutOutput, MaybeMath, MaybeResolve,
-    RequestedAxis, ResolveOrZero as _, RunMode, Size, SizingMode,
+    Position, RequestedAxis, ResolveOrZero as _, RunMode, Size, SizingMode,
 };
 
 /// Whether an element is a replaced element laid out as a leaf box with an
@@ -216,11 +216,18 @@ pub fn compute_replaced_layout(
         .min_size()
         .maybe_resolve(parent_size, &resolve_calc_value)
         .maybe_sub(box_sizing_adjustment);
+    // Taffy passes an out-of-flow box the containing block's size as available space, but
+    // CSS 2.2 §10.3.8/§10.6.5 size an abspos replaced box without clamping to it.
+    let available_space_limit = if style.position() == Position::Absolute {
+        Size::NONE
+    } else {
+        available_space.into_options()
+    };
     let max_size = style
         .max_size()
         .maybe_resolve(basis_for_max_and_preferred, &resolve_calc_value)
-        .or(available_space.into_options())
-        .maybe_min(available_space.into_options())
+        .or(available_space_limit)
+        .maybe_min(available_space_limit)
         .maybe_max(min_size)
         .maybe_sub(box_sizing_adjustment);
 
@@ -395,4 +402,68 @@ pub fn compute_replaced_layout(
     };
 
     LayoutOutput::from_sizes(size + pb_sum, overflow_rect_for(size))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{Attribute, BaseDocument, DocumentConfig, qual_name};
+    use blitz_traits::shell::{ColorScheme, Viewport};
+
+    /// Lay out `<div style="position:relative;height:40px"><canvas width=100 height=100
+    /// style="position:{position};left:10px;top:10px"></div>` and return the canvas size.
+    /// The parent is shorter than the canvas, so any clamp to the containing block shows.
+    fn canvas_size(position: &str) -> (f32, f32) {
+        let mut doc = BaseDocument::new(DocumentConfig {
+            viewport: Some(Viewport::new(400, 300, 1.0, ColorScheme::Light)),
+            ..Default::default()
+        });
+        let root_id = doc.root_node().id;
+        let attr = |name, value: &str| Attribute {
+            name,
+            value: value.to_string(),
+        };
+
+        let mut mutator = doc.mutate();
+        let html = mutator.create_element(qual_name!("html"), vec![]);
+        let body = mutator.create_element(
+            qual_name!("body"),
+            vec![attr(qual_name!("style"), "margin:0")],
+        );
+        let parent = mutator.create_element(
+            qual_name!("div"),
+            vec![attr(qual_name!("style"), "position:relative;height:40px")],
+        );
+        let canvas = mutator.create_element(
+            qual_name!("canvas"),
+            vec![
+                attr(qual_name!("width"), "100"),
+                attr(qual_name!("height"), "100"),
+                attr(
+                    qual_name!("style"),
+                    &format!("position:{position};left:10px;top:10px"),
+                ),
+            ],
+        );
+        mutator.append_children(parent, &[canvas]);
+        mutator.append_children(body, &[parent]);
+        mutator.append_children(html, &[body]);
+        mutator.append_children(root_id, &[html]);
+        drop(mutator);
+
+        doc.resolve(0.0);
+        let size = doc.nodes[canvas].final_layout().size;
+        (size.width, size.height)
+    }
+
+    #[test]
+    fn out_of_flow_canvas_keeps_attribute_size_beyond_containing_block() {
+        for position in ["absolute", "fixed"] {
+            assert_eq!(
+                canvas_size(position),
+                (100.0, 100.0),
+                "a position:{position} canvas sized only by its width/height attributes must not \
+                 be clamped to its containing block (CSS 2.2 §10.3.8/§10.6.5)"
+            );
+        }
+    }
 }
