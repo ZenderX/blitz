@@ -412,6 +412,44 @@ fn classify_flow_children(
     }
 }
 
+/// (Re)parse an inline `<svg>` element's subtree into its `special_data`, resolving
+/// `currentColor` against the element's computed CSS `color`.
+#[cfg(feature = "svg")]
+pub(crate) fn parse_inline_svg(doc: &mut BaseDocument, svg_node_id: NodeId) {
+    // Already parsed now, so a queued colour-change re-parse would be redundant
+    doc.pending_svg_reparse_nodes
+        .retain(|&id| id != svg_node_id);
+    let mut outer_html = doc.get_node(svg_node_id).unwrap().outer_html();
+
+    // HACK: usvg fails to parse SVGs that don't have the SVG xmlns set. So inject it
+    // if the generated source doesn't have it.
+    if !outer_html.contains("xmlns") {
+        outer_html = outer_html.replace("<svg", "<svg xmlns=\"http://www.w3.org/2000/svg\"");
+    }
+
+    match crate::util::parse_svg_image(outer_html.as_bytes()) {
+        Ok(svg) => {
+            doc.get_node_mut(svg_node_id)
+                .unwrap()
+                .element_data_mut()
+                .unwrap()
+                .special_data =
+                SpecialElementData::Image(Box::new(crate::node::ImageData::Svg(svg)));
+        }
+        Err(err) => {
+            #[cfg(feature = "tracing")]
+            tracing::warn!(
+                node_id = ?svg_node_id,
+                html = outer_html,
+                error = ?err,
+                "SVG parse failed",
+            );
+            #[cfg(not(feature = "tracing"))]
+            let _ = err;
+        }
+    }
+}
+
 pub(crate) fn collect_layout_children(
     doc: &mut BaseDocument,
     container_node_id: NodeId,
@@ -462,41 +500,12 @@ fn collect_layout_children_with_wrap(
 
         #[cfg(feature = "svg")]
         if matches!(tag_name, "svg") {
-            let mut outer_html = doc.get_node(container_node_id).unwrap().outer_html();
-
-            // HACK: usvg fails to parse SVGs that don't have the SVG xmlns set. So inject it
-            // if the generated source doesn't have it.
-            if !outer_html.contains("xmlns") {
-                outer_html =
-                    outer_html.replace("<svg", "<svg xmlns=\"http://www.w3.org/2000/svg\"");
-            }
-
             // Remove contruction damage from subtree
             doc.iter_subtree_mut(container_node_id, |id: NodeId, doc: &mut BaseDocument| {
                 doc.nodes[id].remove_damage(CONSTRUCT_BOX | CONSTRUCT_DESCENDENT | CONSTRUCT_FC);
             });
 
-            match crate::util::parse_svg_image(outer_html.as_bytes()) {
-                Ok(svg) => {
-                    doc.get_node_mut(container_node_id)
-                        .unwrap()
-                        .element_data_mut()
-                        .unwrap()
-                        .special_data =
-                        SpecialElementData::Image(Box::new(crate::node::ImageData::Svg(svg)));
-                }
-                Err(err) => {
-                    #[cfg(feature = "tracing")]
-                    tracing::warn!(
-                        node_id = ?container_node_id,
-                        html = outer_html,
-                        error = ?err,
-                        "SVG parse failed",
-                    );
-                    #[cfg(not(feature = "tracing"))]
-                    let _ = err;
-                }
-            };
+            parse_inline_svg(doc, container_node_id);
             return;
         }
 

@@ -335,6 +335,10 @@ pub struct BaseDocument {
     /// the style traversal and by pseudo-element box construction).
     pub(crate) pending_style_image_nodes: Vec<NodeId>,
 
+    /// Inline `<svg>` nodes whose computed `color` changed, so their parsed tree
+    /// (which bakes in `currentColor`) must be rebuilt without box reconstruction.
+    pub(crate) pending_svg_reparse_nodes: Vec<NodeId>,
+
     // Tracks in-flight "critical" resources (e.g. stylesheets linked from the `<head>`),
     // keyed by request id
     pub(crate) pending_critical_resources: HashSet<usize>,
@@ -606,6 +610,7 @@ impl BaseDocument {
             image_cache: ImageCache::default(),
             pending_images: HashMap::new(),
             pending_style_image_nodes: Vec::new(),
+            pending_svg_reparse_nodes: Vec::new(),
             pending_critical_resources: HashSet::new(),
             controls_to_form: HashMap::new(),
             net_provider,
@@ -3430,6 +3435,285 @@ mod changed_nodes_tests {
             doc.controls_to_form.len(),
             1,
             "only the one live control may keep a form-owner entry"
+        );
+    }
+}
+
+#[cfg(test)]
+mod restyle_colour_tests {
+    use super::*;
+    use crate::{Attribute, qual_name};
+    use blitz_traits::shell::ColorScheme;
+
+    fn new_doc(user_agent_css: &str) -> BaseDocument {
+        let mut doc = BaseDocument::new(DocumentConfig {
+            viewport: Some(Viewport::new(400, 300, 1.0, ColorScheme::Light)),
+            ..Default::default()
+        });
+        doc.add_user_agent_stylesheet(user_agent_css);
+        doc
+    }
+
+    fn attr(name: markup5ever::QualName, value: &str) -> Attribute {
+        Attribute {
+            name,
+            value: value.to_string(),
+        }
+    }
+
+    fn text_color(doc: &BaseDocument, id: NodeId) -> String {
+        format!(
+            "{:?}",
+            doc.nodes[id].primary_styles().unwrap().clone_color()
+        )
+    }
+
+    /// An anonymous block wraps the bare text of an `inline-flex` container that
+    /// also has an element child. A restyle that only changes `color` does not
+    /// reconstruct boxes, so the block's style must follow its parent's or the
+    /// text keeps painting in the old colour.
+    #[test]
+    fn anonymous_block_follows_parent_color_on_restyle() {
+        let mut doc = new_doc(
+            ".chip { display: inline-flex; color: rgb(1, 2, 3); transition: color 1s linear; } \
+             .chip[aria-pressed=true] { color: rgb(255, 255, 255); }",
+        );
+        let root_id = doc.root_node().id;
+
+        let mut mutator = doc.mutate();
+        let html = mutator.create_element(qual_name!("html"), vec![]);
+        let body = mutator.create_element(qual_name!("body"), vec![]);
+        let chip = mutator.create_element(
+            qual_name!("button"),
+            vec![attr(qual_name!("class"), "chip")],
+        );
+        let icon = mutator.create_element(qual_name!("span"), vec![]);
+        let text = mutator.create_text_node("Financial Analyst");
+        mutator.append_children(chip, &[icon, text]);
+        mutator.append_children(body, &[chip]);
+        mutator.append_children(html, &[body]);
+        mutator.append_children(root_id, &[html]);
+        drop(mutator);
+        doc.resolve(0.0);
+
+        let anon_id = *doc.nodes[chip]
+            .anonymous_blocks
+            .first()
+            .expect("bare text in a flex container is wrapped in an anonymous block");
+        assert_eq!(text_color(&doc, anon_id), text_color(&doc, chip));
+        let initial = text_color(&doc, chip);
+
+        // The attribute change starts the transition (and reconstructs boxes); the
+        // later ticks only restyle `color`.
+        doc.mutate()
+            .set_attribute(chip, qual_name!("aria-pressed"), "true");
+        doc.resolve(0.0);
+        doc.resolve(0.5);
+
+        let anon_id = doc.nodes[chip].anonymous_blocks[0];
+        let mid_transition = text_color(&doc, chip);
+        assert_ne!(mid_transition, initial, "the chip itself is mid-transition");
+        assert_eq!(
+            text_color(&doc, anon_id),
+            mid_transition,
+            "the anonymous block must take the restyled parent's colour"
+        );
+    }
+
+    /// `currentColor` inside an inline `<svg>` is the svg element's CSS `color`,
+    /// and it must be re-resolved when that colour changes.
+    /// Build `html > body > div.host > svg > [wrapper `g`] > rect[fill=currentColor]`.
+    /// `svg_color` is a `color` attribute on the svg root; `g_color` wraps the rect
+    /// in a `<g color>` with a nested `<svg>` inside it.
+    #[cfg(feature = "svg")]
+    fn svg_fixture(
+        css: &str,
+        svg_color: Option<&str>,
+        g_color: Option<&str>,
+    ) -> (BaseDocument, NodeId, NodeId) {
+        let mut doc = new_doc(css);
+        let root_id = doc.root_node().id;
+
+        let mut mutator = doc.mutate();
+        let html = mutator.create_element(qual_name!("html"), vec![]);
+        let body = mutator.create_element(qual_name!("body"), vec![]);
+        let host =
+            mutator.create_element(qual_name!("div"), vec![attr(qual_name!("class"), "host")]);
+        let mut svg_attrs = vec![
+            attr(qual_name!("width"), "20"),
+            attr(qual_name!("height"), "20"),
+            attr(qual_name!("viewBox"), "0 0 20 20"),
+        ];
+        if let Some(c) = svg_color {
+            svg_attrs.push(attr(qual_name!("color"), c));
+        }
+        let svg = mutator.create_element(qual_name!("svg", svg), svg_attrs);
+        let rect = mutator.create_element(
+            qual_name!("rect", svg),
+            vec![
+                attr(qual_name!("width"), "20"),
+                attr(qual_name!("height"), "20"),
+                attr(qual_name!("fill"), "currentColor"),
+            ],
+        );
+        match g_color {
+            Some(c) => {
+                let g = mutator
+                    .create_element(qual_name!("g", svg), vec![attr(qual_name!("color"), c)]);
+                let inner = mutator.create_element(qual_name!("svg", svg), vec![]);
+                mutator.append_children(inner, &[rect]);
+                mutator.append_children(g, &[inner]);
+                mutator.append_children(svg, &[g]);
+            }
+            None => mutator.append_children(svg, &[rect]),
+        }
+        mutator.append_children(host, &[svg]);
+        mutator.append_children(body, &[host]);
+        mutator.append_children(html, &[body]);
+        mutator.append_children(root_id, &[html]);
+        drop(mutator);
+        doc.resolve(0.0);
+        (doc, host, svg)
+    }
+
+    /// Fill colour of the first path in the svg's parsed tree.
+    #[cfg(feature = "svg")]
+    fn fill_rgb(doc: &BaseDocument, svg: NodeId) -> [u8; 3] {
+        fn first_path(group: &usvg::Group) -> Option<&usvg::Path> {
+            group.children().iter().find_map(|n| match n {
+                usvg::Node::Path(p) => Some(&**p),
+                usvg::Node::Group(g) => first_path(g),
+                _ => None,
+            })
+        }
+        let tree = doc.nodes[svg]
+            .element_data()
+            .and_then(|el| el.svg_data())
+            .expect("inline svg is parsed");
+        let path = first_path(tree.root()).expect("the rect becomes a path");
+        let Some(usvg::Paint::Color(c)) = path.fill().map(|f| f.paint()) else {
+            panic!("expected a solid fill");
+        };
+        [c.red, c.green, c.blue]
+    }
+
+    #[cfg(feature = "svg")]
+    #[test]
+    fn inline_svg_current_color_follows_css_color() {
+        let (mut doc, host, svg) = svg_fixture(
+            ".host { color: rgb(10, 20, 30); } \
+             .host[title] { color: rgb(255, 255, 255); }",
+            None,
+            None,
+        );
+
+        assert_eq!(fill_rgb(&doc, svg), [10, 20, 30]);
+
+        doc.mutate().set_attribute(host, qual_name!("title"), "on");
+        doc.resolve(0.0);
+
+        assert_eq!(
+            fill_rgb(&doc, svg),
+            [255, 255, 255],
+            "svg tree must be rebuilt with the new inherited colour"
+        );
+    }
+
+    /// An explicit `color` attribute on the svg root beats the inherited CSS colour.
+    #[cfg(feature = "svg")]
+    #[test]
+    fn inline_svg_root_color_attribute_beats_css_color() {
+        let (doc, _, svg) = svg_fixture(
+            ".host { color: rgb(10, 20, 30); }",
+            Some("rgb(200, 0, 0)"),
+            None,
+        );
+        assert_eq!(fill_rgb(&doc, svg), [200, 0, 0]);
+    }
+
+    /// SVG presentation attributes rank below all author CSS, so an inline `style`
+    /// `color` beats the `color` attribute on the same element.
+    #[cfg(feature = "svg")]
+    #[test]
+    fn inline_svg_style_color_beats_color_attribute() {
+        let (mut doc, _, svg) = svg_fixture("", Some("rgb(200, 0, 0)"), None);
+        assert_eq!(fill_rgb(&doc, svg), [200, 0, 0]);
+
+        doc.mutate()
+            .set_attribute(svg, qual_name!("style"), "color: rgb(0, 0, 200)");
+        doc.resolve(0.0);
+        assert_eq!(fill_rgb(&doc, svg), [0, 0, 200]);
+    }
+
+    /// A stylesheet rule that hits a descendant beats the `color` attribute that
+    /// descendant inherits from the svg root.
+    #[cfg(feature = "svg")]
+    #[test]
+    fn inline_svg_css_color_on_descendant_beats_inherited_color_attribute() {
+        let (mut doc, _, svg) = svg_fixture(
+            ".b { color: rgb(0, 0, 200); }",
+            Some("rgb(200, 0, 0)"),
+            None,
+        );
+        assert_eq!(fill_rgb(&doc, svg), [200, 0, 0]);
+
+        let rect = doc.nodes[svg].children[0];
+        doc.mutate().set_attribute(rect, qual_name!("class"), "b");
+        doc.resolve(0.0);
+        assert_eq!(fill_rgb(&doc, svg), [0, 0, 200]);
+    }
+
+    /// A colour change that only reaches an svg descendant still re-resolves the
+    /// `currentColor` baked into the parsed tree.
+    #[cfg(feature = "svg")]
+    #[test]
+    fn inline_svg_descendant_only_color_change_reparses_the_tree() {
+        let (mut doc, host, svg) = svg_fixture(
+            ".host { color: rgb(10, 20, 30); } \
+             .host[title] rect { color: rgb(255, 255, 255); }",
+            None,
+            None,
+        );
+        assert_eq!(fill_rgb(&doc, svg), [10, 20, 30]);
+
+        doc.mutate().set_attribute(host, qual_name!("title"), "on");
+        doc.resolve(0.0);
+        assert_eq!(fill_rgb(&doc, svg), [255, 255, 255]);
+    }
+
+    /// A `color` on an intermediate `<g>` beats the colour inherited from the root.
+    #[cfg(feature = "svg")]
+    #[test]
+    fn inline_svg_nested_color_beats_injected_root_color() {
+        let (doc, _, svg) = svg_fixture(
+            ".host { color: rgb(10, 20, 30); }",
+            None,
+            Some("rgb(0, 200, 0)"),
+        );
+        assert_eq!(fill_rgb(&doc, svg), [0, 200, 0]);
+    }
+
+    /// A `transition: color` tick on the svg's parent re-resolves `currentColor`
+    /// each frame, without reconstructing boxes.
+    #[cfg(feature = "svg")]
+    #[test]
+    fn inline_svg_current_color_follows_color_transition() {
+        let (mut doc, host, svg) = svg_fixture(
+            ".host { color: rgb(0, 0, 0); transition: color 1s linear; } \
+             .host[title] { color: rgb(200, 200, 200); }",
+            None,
+            None,
+        );
+        assert_eq!(fill_rgb(&doc, svg), [0, 0, 0]);
+
+        doc.mutate().set_attribute(host, qual_name!("title"), "on");
+        doc.resolve(0.0);
+        doc.resolve(0.5);
+
+        let mid = fill_rgb(&doc, svg);
+        assert!(
+            mid[0] > 0 && mid[0] < 200,
+            "fill must track the mid-transition colour, got {mid:?}"
         );
     }
 }

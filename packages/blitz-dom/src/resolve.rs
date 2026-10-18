@@ -94,6 +94,15 @@ impl BaseDocument {
         // nodes whose style changed (queued by the style traversal and by
         // pseudo-element box construction), fetching any not-yet-loaded images.
         self.flush_pending_style_images();
+        #[cfg(feature = "svg")]
+        for node_id in std::mem::take(&mut self.pending_svg_reparse_nodes) {
+            // The node may have been removed between queueing and now
+            if self.nodes.contains_key(node_id) {
+                crate::layout::construct::parse_inline_svg(self, node_id);
+            }
+        }
+        #[cfg(not(feature = "svg"))]
+        self.pending_svg_reparse_nodes.clear();
         timer.record_time("pconstruct");
 
         // Merge stylo into taffy

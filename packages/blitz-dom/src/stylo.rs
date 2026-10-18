@@ -142,6 +142,7 @@ impl crate::document::BaseDocument {
         let token = RecalcStyle::pre_traverse(root, &context);
 
         let mut nodes_needing_style_image_flush = Vec::new();
+        let mut svg_nodes_to_reparse = Vec::new();
         if token.should_traverse() {
             // Style the elements, resolving their data
             let mut traverser = RecalcStyle::new(context);
@@ -152,9 +153,16 @@ impl crate::document::BaseDocument {
             style::driver::traverse_dom(&traverser, token, rayon_pool);
             nodes_needing_style_image_flush =
                 std::mem::take(traverser.nodes_needing_style_image_flush.get_mut().unwrap());
+            svg_nodes_to_reparse =
+                std::mem::take(traverser.svg_nodes_to_reparse.get_mut().unwrap());
         }
         self.pending_style_image_nodes
             .extend(nodes_needing_style_image_flush);
+        for id in svg_nodes_to_reparse {
+            if !self.pending_svg_reparse_nodes.contains(&id) {
+                self.pending_svg_reparse_nodes.push(id);
+            }
+        }
 
         for opaque in self.snapshots.keys() {
             let id = NodeId::from_u64(opaque.id() as u64);
@@ -1046,6 +1054,37 @@ impl<'a> TElement for BlitzNode<'a> {
                 }
             }
 
+            // https://svgwg.org/svg2-draft/painting.html#SpecifyingPaint
+            // The `color` attribute on SVG elements is a presentation attribute for the
+            // CSS `color` property. Mapping it at the PresHints level keeps it below all
+            // author CSS, and gives descendants the inherited value for `currentColor`.
+            if *name == local_name!("color") && elem.name.ns == markup5ever::ns!(svg) {
+                use style::parser::{Parse, ParserContext};
+                use style::stylesheets::{CssRuleType, Origin};
+                use style::values::specified::ColorPropertyValue;
+                use style_traits::ParsingMode;
+
+                let url_extra_data = crate::url::DocumentUrl::default().url_extra_data();
+                let context = ParserContext::new(
+                    Origin::Author,
+                    &url_extra_data,
+                    Some(CssRuleType::Style),
+                    ParsingMode::DEFAULT,
+                    QuirksMode::NoQuirks,
+                    Default::default(),
+                    None,
+                    None,
+                    Default::default(),
+                );
+                let mut input = cssparser::ParserInput::new(value);
+                let mut parser = style::values::Parser::new(&mut input);
+                if let Ok(color) = ColorPropertyValue::parse(&context, &mut parser)
+                    && parser.expect_exhausted().is_ok()
+                {
+                    push_style(PropertyDeclaration::Color(color));
+                }
+            }
+
             // The `border` attribute maps to the four border widths as a
             // pixel length, plus the four border styles as `solid` -- width
             // alone would compute back to zero against the default
@@ -1235,6 +1274,8 @@ pub struct RecalcStyle<'a> {
     /// dedicated storage on the node (see `flush_image_layers_from_style`)
     /// because their style changed during this traversal.
     nodes_needing_style_image_flush: Mutex<Vec<NodeId>>,
+    /// Inline `<svg>` elements whose computed `color` changed during this traversal.
+    svg_nodes_to_reparse: Mutex<Vec<NodeId>>,
 }
 
 impl<'a> RecalcStyle<'a> {
@@ -1242,6 +1283,7 @@ impl<'a> RecalcStyle<'a> {
         RecalcStyle {
             context,
             nodes_needing_style_image_flush: Mutex::new(Vec::new()),
+            svg_nodes_to_reparse: Mutex::new(Vec::new()),
         }
     }
 }
@@ -1258,9 +1300,35 @@ impl<'dom> DomTraversal<BlitzNode<'dom>> for RecalcStyle<'_> {
         if let Some(el) = node.as_element() {
             // let mut data = el.mutate_data().unwrap();
             let mut data = unsafe { el.ensure_data() };
+            #[cfg(feature = "svg")]
+            let in_svg = is_svg_element(el);
+            #[cfg(not(feature = "svg"))]
+            let in_svg = false;
+            // Only elements whose anonymous blocks or inline SVG depend on the primary style
+            // need the pre-restyle style to detect a change.
+            let old_primary = (in_svg || !el.anonymous_blocks.is_empty())
+                .then(|| data.styles.get_primary().cloned())
+                .flatten();
             recalc_style_at(self, traversal_data, context, el, &mut data, note_child);
 
             sync_pseudo_element_styles(el, &data, &self.nodes_needing_style_image_flush);
+
+            if let (Some(old), Some(new)) = (old_primary, data.styles.get_primary().cloned())
+                && !std::ptr::eq(&*old, &*new)
+            {
+                sync_anonymous_block_styles(el, &new, context.shared);
+                // Inline SVG is rasterised from a tree built with every element's own
+                // computed `color` baked in (for `currentColor`), so a colour change on
+                // the root or any descendant needs a re-parse of the whole tree. The
+                // box tree is unaffected, so this avoids construction damage.
+                if in_svg && old.clone_color() != new.clone_color() {
+                    let root = outermost_svg_ancestor(el);
+                    let mut queued = self.svg_nodes_to_reparse.lock().unwrap();
+                    if !queued.contains(&root) {
+                        queued.push(root);
+                    }
+                }
+            }
 
             if !data.damage.is_empty() {
                 // Mark the ancestor chain so that the damage propagation pass
@@ -1377,6 +1445,80 @@ fn sync_pseudo_element_styles(
         }
         pe_data.styles.primary = Some(pe_style);
         pe_data.set_restyled();
+    }
+}
+
+/// The outermost SVG-namespace ancestor (or self) of an element: the inline `<svg>` root,
+/// which is what box construction rasterises.
+#[cfg(feature = "svg")]
+fn outermost_svg_ancestor(el: &Node) -> NodeId {
+    let mut root = el;
+    while let Some(parent) = root.parent.map(|id| el.with(id)) {
+        if !is_svg_element(parent) {
+            break;
+        }
+        root = parent;
+    }
+    root.id
+}
+
+#[cfg(feature = "svg")]
+fn is_svg_element(node: &Node) -> bool {
+    node.data
+        .downcast_element()
+        .is_some_and(|e| e.name.ns == markup5ever::ns!(svg))
+}
+
+#[cfg(not(feature = "svg"))]
+fn outermost_svg_ancestor(el: &Node) -> NodeId {
+    el.id
+}
+
+/// Recompute the styles of an element's anonymous blocks from its freshly-computed
+/// primary style.
+///
+/// Anonymous boxes inherit every inherited property from their parent and are
+/// otherwise initial (CSS 2.1 section 9.2.1.1), so they must follow the parent's
+/// style. Box construction derives their style once, and a restyle that needs no
+/// reconstruction (e.g. a `color` transition tick) would leave them stale: text
+/// inside takes its glyph colour from the anonymous block.
+///
+/// SAFETY: as with `sync_pseudo_element_styles`, anonymous blocks are not part of
+/// the DOM child list, so they are only reached from their owner's
+/// `process_preorder` and no other traversal thread can touch their stylo data.
+#[allow(unsafe_code)]
+fn sync_anonymous_block_styles(
+    el: &Node,
+    parent_style: &style::servo_arc::Arc<ComputedValues>,
+    shared: &SharedStyleContext<'_>,
+) {
+    for &anon_id in &el.anonymous_blocks {
+        let anon_node = el.with(anon_id);
+        let Some(stylo_data) = anon_node.stylo_element_data_opt() else {
+            continue;
+        };
+        let Some(mut anon_data) = (unsafe { stylo_data.unsafe_stylo_only_mut() }) else {
+            continue;
+        };
+        let Some(old_style) = anon_data.styles.primary.clone() else {
+            continue;
+        };
+
+        let new_style = shared.stylist.style_for_anonymous::<&Node>(
+            &shared.guards,
+            &PseudoElement::ServoAnonymousBox,
+            parent_style,
+        );
+        let diff = RestyleDamage::compute_style_difference::<&Node>(&old_style, &new_style);
+        if !diff.damage.is_empty() {
+            anon_data.damage.insert(diff.damage);
+            anon_node.mark_damaged();
+        }
+        anon_data.styles.primary = Some(new_style.clone());
+        anon_data.set_restyled();
+        drop(anon_data);
+
+        sync_anonymous_block_styles(anon_node, &new_style, shared);
     }
 }
 
