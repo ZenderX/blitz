@@ -3520,8 +3520,8 @@ mod restyle_colour_tests {
         );
     }
 
-    /// `currentColor` inside an inline `<svg>` is the svg element's CSS `color`,
-    /// and it must be re-resolved when that colour changes.
+    /// Each svg element's own computed `color` is baked into its `currentColor`
+    /// attributes when the tree is parsed, and re-baked when any of them changes.
     /// Build `html > body > div.host > svg > [wrapper `g`] > rect[fill=currentColor]`.
     /// `svg_color` is a `color` attribute on the svg root; `g_color` wraps the rect
     /// in a `<g color>` with a nested `<svg>` inside it.
@@ -3681,10 +3681,11 @@ mod restyle_colour_tests {
         assert_eq!(fill_rgb(&doc, svg), [255, 255, 255]);
     }
 
-    /// A `color` on an intermediate `<g>` beats the colour inherited from the root.
+    /// A `color` presentation attribute on an intermediate `<g>` beats the colour
+    /// inherited from the host.
     #[cfg(feature = "svg")]
     #[test]
-    fn inline_svg_nested_color_beats_injected_root_color() {
+    fn inline_svg_nested_g_color_attribute_beats_inherited_color() {
         let (doc, _, svg) = svg_fixture(
             ".host { color: rgb(10, 20, 30); }",
             None,
