@@ -60,7 +60,7 @@ impl BaseDocument {
         }
 
         let damage_for_children = RestyleDamage::empty();
-        let children = std::mem::take(&mut self.nodes[node_id].children);
+        let children = self.nodes[node_id].take_children_for_iteration();
         let layout_children = std::mem::take(self.nodes[node_id].layout_children.get_mut());
         let use_layout_children = self.nodes[node_id].should_traverse_layout_children();
         if use_layout_children {
@@ -69,7 +69,7 @@ impl BaseDocument {
                 damage |= self.propagate_damage_flags(*child, damage_for_children);
             }
         } else {
-            for child in children.iter() {
+            for child in children.ids() {
                 damage |= self.propagate_damage_flags(*child, damage_for_children);
             }
             if let Some(before_id) = self.nodes[node_id].before() {
@@ -83,7 +83,7 @@ impl BaseDocument {
         let node = &mut self.nodes[node_id];
 
         // Put children back
-        node.children = children;
+        node.restore_children(children);
         *node.layout_children.get_mut() = layout_children;
 
         if damage.contains(CONSTRUCT_BOX) {
@@ -143,9 +143,9 @@ impl BaseDocument {
             }
         }
 
-        let children = std::mem::take(&mut self.nodes[node_id].children);
+        let children = self.nodes[node_id].take_children_for_iteration();
         let layout_children = std::mem::take(self.nodes[node_id].layout_children.get_mut());
-        for child in children.iter() {
+        for child in children.ids() {
             self.clear_damage_and_dirty_flags(*child);
         }
         if let Some(layout_children) = layout_children.as_ref() {
@@ -161,7 +161,7 @@ impl BaseDocument {
         }
 
         let node = &mut self.nodes[node_id];
-        node.children = children;
+        node.restore_children(children);
         *node.layout_children.get_mut() = layout_children;
         node.clear_damage_mut();
         node.unset_damaged_descendants();

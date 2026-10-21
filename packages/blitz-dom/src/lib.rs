@@ -55,6 +55,8 @@ mod resolve;
 /// Scrolling of nodes and the viewport, and scroll animations.
 mod scrolling;
 mod selection;
+/// Shadow roots, slot assignment and the flat tree.
+mod shadow;
 /// Implementations that interact with servo's style engine
 mod stylo;
 mod stylo_to_cursor_icon;
@@ -89,6 +91,7 @@ pub use mutator::DocumentMutator;
 pub use node::{Attribute, DocumentData, ElementData, Node, NodeData, TextNodeData};
 pub use parley::FontContext;
 pub use scrolling::{ScrollBehavior, ScrollLogicalPosition};
+pub use shadow::{AttachShadowError, ShadowLink};
 pub use tree::NodeTree;
 
 /// Convert a Blitz [`NodeId`] into a [`taffy::NodeId`] (which wraps a `u64`).

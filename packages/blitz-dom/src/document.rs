@@ -33,7 +33,7 @@ use selectors::{Element, matching::QuirksMode};
 use smallvec::SmallVec;
 use std::any::Any;
 use std::cell::RefCell;
-use std::collections::{BTreeMap, Bound, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, Bound, HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 use std::rc::Rc;
 use std::str::FromStr;
@@ -57,12 +57,13 @@ use style::values::computed::UserSelect;
 use style::values::computed::ui::CursorKind;
 use style::values::specified::box_::{DisplayInside, DisplayOutside};
 use style::{
+    author_styles::AuthorStyles,
     device::Device,
     dom::{TDocument, TNode},
     media_queries::MediaList,
     selector_parser::SnapshotMap,
     shared_lock::{SharedRwLock, StylesheetGuards},
-    stylesheets::{AllowImportRules, DocumentStyleSheet, Origin, Stylesheet},
+    stylesheets::{AllowImportRules, CustomMediaMap, DocumentStyleSheet, Origin, Stylesheet},
     stylist::Stylist,
 };
 use style_dom::ElementState;
@@ -299,6 +300,12 @@ pub struct BaseDocument {
     pub(crate) nodes_to_id: HashMap<String, SmallVec<[NodeId; 1]>>,
     /// Map of `<style>` and `<link>` node IDs to their associated stylesheet
     pub(crate) nodes_to_stylesheet: BTreeMap<NodeId, DocumentStyleSheet>,
+    /// For `<style>` and `<link>` nodes registered in a shadow tree: the shadow
+    /// root whose `AuthorStyles` holds the sheet (absent for document sheets).
+    /// Kept so a sheet can be unregistered after its node left the tree.
+    pub(crate) shadow_sheet_roots: HashMap<NodeId, NodeId>,
+    /// Shadow roots whose sheets changed since their cascade data was last rebuilt
+    pub(crate) dirty_shadow_style_roots: BTreeSet<NodeId>,
     /// Stylesheets added by the useragent
     /// where the key is the hashed CSS
     pub(crate) ua_stylesheets: HashMap<String, DocumentStyleSheet>,
@@ -582,6 +589,8 @@ impl BaseDocument {
             url: base_url,
             ua_stylesheets: HashMap::new(),
             nodes_to_stylesheet: BTreeMap::new(),
+            shadow_sheet_roots: HashMap::new(),
+            dirty_shadow_style_roots: BTreeSet::new(),
             font_ctx,
             #[cfg(feature = "parallel-construct")]
             thread_font_contexts: ThreadLocal::new(),
@@ -1099,6 +1108,11 @@ impl BaseDocument {
                 self.drop_node_ignoring_parent_with(child, on_drop);
             }
 
+            // A shadow root is not in the child list, so it is dropped with its host
+            if let Some(root) = node.shadow_root_id() {
+                self.drop_node_ignoring_parent_with(root, on_drop);
+            }
+
             // Anonymous blocks live only in the slab, so deallocate the ones this
             // node owns rather than leaking them.
             for &anon_id in &node.anonymous_blocks {
@@ -1311,10 +1325,11 @@ impl BaseDocument {
     }
 
     pub fn add_stylesheet_for_node(&mut self, stylesheet: DocumentStyleSheet, node_id: NodeId) {
-        let old = self.nodes_to_stylesheet.insert(node_id, stylesheet.clone());
+        // A sheet in a shadow tree is scoped to that tree's own `AuthorStyles`
+        let root_id = self.nodes[node_id].containing_shadow_root_id();
 
-        if let Some(old) = old {
-            self.stylist.remove_stylesheet(old, &self.guard.read())
+        if let Some(old) = self.nodes_to_stylesheet.insert(node_id, stylesheet.clone()) {
+            self.unregister_stylesheet(node_id, old);
         }
 
         // Fetch @font-face fonts
@@ -1337,18 +1352,87 @@ impl BaseDocument {
         let insertion_point = self
             .nodes_to_stylesheet
             .range((Bound::Excluded(node_id), Bound::Unbounded))
-            .next()
-            .map(|(_, sheet)| sheet);
+            .find(|(id, _)| self.shadow_sheet_roots.get(id).copied() == root_id)
+            .map(|(_, sheet)| sheet.clone());
 
-        if let Some(insertion_point) = insertion_point {
-            self.stylist.insert_stylesheet_before(
-                stylesheet,
-                insertion_point.clone(),
-                &self.guard.read(),
-            )
-        } else {
-            self.stylist
-                .append_stylesheet(stylesheet, &self.guard.read())
+        let guard = self.guard.read();
+        let Some(root_id) = root_id else {
+            match insertion_point {
+                Some(before) => self
+                    .stylist
+                    .insert_stylesheet_before(stylesheet, before, &guard),
+                None => self.stylist.append_stylesheet(stylesheet, &guard),
+            }
+            return;
+        };
+
+        let Some(element) = self.nodes[root_id].element_data_mut() else {
+            return;
+        };
+        // No device: invalidations are not collected for shadow trees, and a changed
+        // sheet restyles the whole host subtree instead (see `flush_shadow_styles`).
+        let sheets = &mut element
+            .shadow_styles
+            .get_or_insert_with(|| Box::new(AuthorStyles::new()))
+            .stylesheets;
+        let custom_media = CustomMediaMap::default();
+        match insertion_point {
+            Some(before) => {
+                sheets.insert_stylesheet_before(None, &custom_media, stylesheet, before, &guard)
+            }
+            None => sheets.append_stylesheet(None, &custom_media, stylesheet, &guard),
+        }
+        self.shadow_sheet_roots.insert(node_id, root_id);
+        self.dirty_shadow_style_roots.insert(root_id);
+    }
+
+    /// Remove the sheet of a `<style>`/`<link>` node from wherever it was registered.
+    pub(crate) fn unregister_stylesheet(&mut self, node_id: NodeId, sheet: DocumentStyleSheet) {
+        let guard = self.guard.read();
+        let Some(root_id) = self.shadow_sheet_roots.remove(&node_id) else {
+            self.stylist.remove_stylesheet(sheet, &guard);
+            return;
+        };
+
+        // The root may already be gone with its host
+        let Some(styles) = self
+            .nodes
+            .get_mut(root_id)
+            .and_then(|root| root.element_data_mut())
+            .and_then(|element| element.shadow_styles.as_mut())
+        else {
+            return;
+        };
+        styles
+            .stylesheets
+            .remove_stylesheet(None, &CustomMediaMap::default(), sheet, &guard);
+        self.dirty_shadow_style_roots.insert(root_id);
+    }
+
+    /// Rebuild the cascade data of every shadow root whose sheets changed and
+    /// restyle the host subtrees affected.
+    pub(crate) fn flush_shadow_styles(&mut self) {
+        let mut hosts = Vec::new();
+        {
+            let guard = self.guard.read();
+            for root_id in std::mem::take(&mut self.dirty_shadow_style_roots) {
+                let Some(root) = self.nodes.get_mut(root_id) else {
+                    continue;
+                };
+                let host = root.shadow_host_id();
+                let Some(styles) = root
+                    .element_data_mut()
+                    .and_then(|element| element.shadow_styles.as_mut())
+                else {
+                    continue;
+                };
+                styles.flush(&mut self.stylist, &guard);
+                hosts.extend(host);
+            }
+        }
+        // stylo collects no invalidations for shadow trees: restyle the whole subtree
+        for host in hosts {
+            self.invalidate_flat_tree(host);
         }
     }
 
@@ -2195,6 +2279,19 @@ impl BaseDocument {
             self.stylist.set_device(device, &guards)
         };
         self.stylist.force_stylesheet_origins_dirty(origins);
+
+        // Media queries in shadow sheets depend on the device as well
+        for &root_id in self.shadow_sheet_roots.values() {
+            if let Some(styles) = self
+                .nodes
+                .get_mut(root_id)
+                .and_then(|root| root.element_data_mut())
+                .and_then(|element| element.shadow_styles.as_mut())
+            {
+                styles.stylesheets.force_dirty();
+                self.dirty_shadow_style_roots.insert(root_id);
+            }
+        }
     }
 
     pub fn stylist_device(&mut self) -> &Device {

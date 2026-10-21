@@ -65,7 +65,7 @@ pub(crate) fn build_table_context(
 
     let root_node = &mut doc.nodes[table_root_node_id];
 
-    let children = std::mem::take(&mut root_node.children);
+    let children = root_node.flat_children().into_owned();
 
     let Some(stylo_styles) = root_node.primary_styles() else {
         panic!("Ignoring table because it has no styles");
@@ -162,8 +162,6 @@ pub(crate) fn build_table_context(
     }
 
     let layout_children = cells.iter().map(|cell| cell.node_id).collect();
-    let root_node = &mut doc.nodes[table_root_node_id];
-    root_node.children = children;
 
     (
         TableContext {
@@ -213,7 +211,7 @@ pub(crate) fn collect_table_cells(
         | DisplayInside::TableHeaderGroup
         | DisplayInside::TableFooterGroup
         | DisplayInside::Contents => {
-            let children = std::mem::take(&mut doc.nodes[node_id].children);
+            let children = doc.nodes[node_id].flat_children().into_owned();
             for child_id in children.iter().copied() {
                 doc.nodes[child_id]
                     .remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
@@ -230,7 +228,6 @@ pub(crate) fn collect_table_cells(
                     first_cell_border,
                 );
             }
-            doc.nodes[node_id].children = children;
         }
         DisplayInside::TableRow => {
             node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
@@ -242,7 +239,7 @@ pub(crate) fn collect_table_cells(
                 height: 0.0,
             });
 
-            let children = std::mem::take(&mut doc.nodes[node_id].children);
+            let children = doc.nodes[node_id].flat_children().into_owned();
             for child_id in children.iter().copied() {
                 collect_table_cells(
                     doc,
@@ -257,7 +254,6 @@ pub(crate) fn collect_table_cells(
                     first_cell_border,
                 );
             }
-            doc.nodes[node_id].children = children;
         }
         DisplayInside::TableCell => {
             // node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);

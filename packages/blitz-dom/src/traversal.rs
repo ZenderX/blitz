@@ -8,11 +8,11 @@ use crate::{BaseDocument, Node};
 macro_rules! iter_children {
     ($node_expr:expr, $cb:expr) => {{
         let node = &mut $node_expr;
-        let children = core::mem::take(&mut node.children);
-        for child_id in children.iter().copied() {
+        let children = node.take_children_for_iteration();
+        for child_id in children.ids().iter().copied() {
             $cb(child_id)
         }
-        $node_expr.children = children;
+        $node_expr.restore_children(children);
     }};
 }
 pub(crate) use iter_children;
@@ -25,12 +25,12 @@ macro_rules! iter_children_and_pseudos {
         // Copy before, after, and take children
         let before = node.before();
         let after = node.after();
-        let children = core::mem::take(&mut node.children);
+        let children = node.take_children_for_iteration();
 
         if let Some(before) = before {
             $cb(before)
         }
-        for child_id in children.iter().copied() {
+        for child_id in children.ids().iter().copied() {
             $cb(child_id)
         }
         if let Some(after) = after {
@@ -38,7 +38,7 @@ macro_rules! iter_children_and_pseudos {
         }
 
         // Reload node and put children back
-        $node_expr.children = children;
+        $node_expr.restore_children(children);
     }};
 }
 pub(crate) use iter_children_and_pseudos;
@@ -162,18 +162,21 @@ impl BaseDocument {
         }
     }
 
+    /// Visit the children of a node in the flat tree (see [`Node::flat_children`]).
     pub fn iter_children_mut(
         &mut self,
         node_id: NodeId,
         mut cb: impl FnMut(NodeId, &mut BaseDocument),
     ) {
-        let children = std::mem::take(&mut self.nodes[node_id].children);
-        for child_id in children.iter().cloned() {
+        let children = self.nodes[node_id].take_children_for_iteration();
+        for child_id in children.ids().iter().copied() {
             cb(child_id, self);
         }
-        self.nodes[node_id].children = children;
+        self.nodes[node_id].restore_children(children);
     }
 
+    /// Visit a node and its descendants in DOM order. The shadow tree of a host
+    /// is visited after the host's own children.
     pub fn iter_subtree_mut(
         &mut self,
         node_id: NodeId,
@@ -192,6 +195,13 @@ impl BaseDocument {
                 iter_subtree_mut_inner(doc, child_id, cb);
             }
             doc.nodes[node_id].children = children;
+
+            if let Some(root_id) = doc.nodes[node_id].shadow_root_id() {
+                if doc.nodes.contains_key(root_id) {
+                    cb(root_id, doc);
+                    iter_subtree_mut_inner(doc, root_id, cb);
+                }
+            }
         }
     }
 

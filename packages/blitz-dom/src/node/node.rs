@@ -380,7 +380,7 @@ impl Node {
             DisplayOutside::Block => true,
             _ => {
                 if display.inside() == DisplayInside::Flow {
-                    self.children
+                    self.flat_children()
                         .iter()
                         .copied()
                         .any(|child_id| self.tree()[child_id].is_or_contains_block())
@@ -451,17 +451,19 @@ impl Node {
     /// This propagates the dirty flag up the tree so that the style traversal
     /// knows to visit the subtree containing this node.
     pub fn mark_ancestors_dirty(&self) {
-        let mut current_id = self.parent;
+        let mut current_id = self.marking_parent_id();
         while let Some(parent_id) = current_id {
             let parent = &self.tree()[parent_id];
             // If this ancestor already has dirty_descendants set, we can stop
-            // because all further ancestors must also have it set
+            // because all further ancestors must also have it set. Shadow roots
+            // are the exception: style traversal never visits them, so their
+            // flag is never cleared and says nothing about their host.
             if let Some(flag) = parent.dirty_descendants_flag() {
-                if flag.swap(true, Ordering::Relaxed) {
+                if flag.swap(true, Ordering::Relaxed) && !parent.is_shadow_root() {
                     break;
                 }
             }
-            current_id = parent.parent;
+            current_id = parent.marking_parent_id();
         }
     }
 
@@ -486,21 +488,22 @@ impl Node {
     /// its ancestors have `damaged_descendants` set.
     pub fn mark_damaged(&self) {
         if let Some(flag) = self.damaged_descendants_flag() {
-            if flag.swap(true, Ordering::Relaxed) {
+            if flag.swap(true, Ordering::Relaxed) && !self.is_shadow_root() {
                 return;
             }
         }
-        let mut current_id = self.parent;
+        let mut current_id = self.marking_parent_id();
         while let Some(parent_id) = current_id {
             let parent = &self.tree()[parent_id];
             // If this ancestor already has damaged_descendants set, we can stop
-            // because all further ancestors must also have it set
+            // because all further ancestors must also have it set (except shadow
+            // roots, which damage propagation never visits or clears)
             if let Some(flag) = parent.damaged_descendants_flag() {
-                if flag.swap(true, Ordering::Relaxed) {
+                if flag.swap(true, Ordering::Relaxed) && !parent.is_shadow_root() {
                     break;
                 }
             }
-            current_id = parent.parent;
+            current_id = parent.marking_parent_id();
         }
     }
 

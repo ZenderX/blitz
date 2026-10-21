@@ -9,7 +9,8 @@ use crate::net::{ImageHandler, ResourceHandler, StylesheetHandler};
 use crate::node::{CanvasData, NodeFlags, SpecialElementData};
 use crate::util::ImageType;
 use crate::{
-    Attribute, BaseDocument, Document, ElementData, Node, NodeData, QualName, local_name, qual_name,
+    AttachShadowError, Attribute, BaseDocument, Document, ElementData, Node, NodeData, QualName,
+    local_name, qual_name,
 };
 use blitz_traits::shell::Viewport;
 use style::Atom;
@@ -161,6 +162,13 @@ impl DocumentMutator<'_> {
         self.doc.deep_clone_node(node_id)
     }
 
+    /// Attach a shadow root to `host` (see [`BaseDocument::attach_shadow_root`]).
+    pub fn attach_shadow_root(&mut self, host: NodeId) -> Result<NodeId, AttachShadowError> {
+        let root = self.doc.attach_shadow_root(host)?;
+        self.mutations_occurred |= self.doc.nodes[host].flags.is_in_document();
+        Ok(root)
+    }
+
     // Node mutation methods
 
     pub fn set_node_text(&mut self, node_id: NodeId, value: &str) {
@@ -189,6 +197,7 @@ impl DocumentMutator<'_> {
             if let Some(parent_id) = parent_id {
                 let parent = &mut self.doc.nodes[parent_id];
                 parent.insert_damage(ALL_DAMAGE);
+                self.doc.invalidate_flat_tree_for_child_change(parent_id);
             }
 
             self.maybe_record_node(parent_id);
@@ -204,10 +213,14 @@ impl DocumentMutator<'_> {
         let node = &mut self.doc.nodes[node_id];
         node.insert_damage(ALL_DAMAGE);
         node.mark_ancestors_dirty();
+        let parent_id = node.parent;
         match node.text_data_mut() {
             Some(data) => {
                 data.content += text;
                 self.mutations_occurred |= node_is_in_document;
+                if let Some(parent_id) = parent_id {
+                    self.doc.invalidate_flat_tree_for_child_change(parent_id);
+                }
                 Ok(())
             }
             None => Err(AppendTextErr::NotTextNode),
@@ -235,6 +248,8 @@ impl DocumentMutator<'_> {
 
     pub fn set_attribute(&mut self, node_id: NodeId, name: QualName, value: &str) {
         let node_is_in_document = self.doc.nodes[node_id].flags.is_in_document();
+        self.doc
+            .invalidate_flat_tree_for_attr_change(node_id, &name.local);
         if node_is_in_document {
             self.doc.snapshot_node(node_id);
 
@@ -271,7 +286,10 @@ impl DocumentMutator<'_> {
                 if let Some(old_id) = old_id {
                     self.doc.remove_from_id_map(&old_id, node_id);
                 }
-                self.doc.add_to_id_map(value, node_id);
+                // Ids inside a shadow tree are not visible to the document
+                if !self.doc.nodes[node_id].is_in_shadow_tree() {
+                    self.doc.add_to_id_map(value, node_id);
+                }
             }
         }
 
@@ -361,6 +379,8 @@ impl DocumentMutator<'_> {
 
     pub fn clear_attribute(&mut self, node_id: NodeId, name: QualName) {
         let node_is_in_document = self.doc.nodes[node_id].flags.is_in_document();
+        self.doc
+            .invalidate_flat_tree_for_attr_change(node_id, &name.local);
         if node_is_in_document {
             self.doc.snapshot_node(node_id);
 
@@ -513,6 +533,7 @@ impl DocumentMutator<'_> {
             // Mark ancestors dirty so the style traversal visits this subtree.
             parent.mark_ancestors_dirty();
             parent.children.retain(|id| *id != node_id);
+            self.doc.invalidate_flat_tree_for_child_change(parent_id);
             self.maybe_record_node(parent_id);
         }
     }
@@ -553,6 +574,7 @@ impl DocumentMutator<'_> {
             }
 
             parent.children.retain(|id| *id != node_id);
+            self.doc.invalidate_flat_tree_for_child_change(parent_id);
             self.maybe_record_node(parent_id);
         }
 
@@ -581,6 +603,7 @@ impl DocumentMutator<'_> {
             self.process_removed_subtree(child_id);
             let _ = self.doc.drop_node_ignoring_parent(child_id);
         }
+        self.doc.invalidate_flat_tree_for_child_change(node_id);
         self.maybe_record_node(node_id);
     }
 
@@ -658,6 +681,8 @@ impl DocumentMutator<'_> {
             }
 
             old_parent.children.retain(|id| *id != child_id);
+            self.doc
+                .invalidate_flat_tree_for_child_change(old_parent_id);
             self.maybe_record_node(old_parent_id);
         }
 
@@ -690,6 +715,7 @@ impl DocumentMutator<'_> {
             }
         }
 
+        self.doc.invalidate_flat_tree_for_child_change(parent_id);
         self.maybe_record_node(parent_id);
     }
 
@@ -895,9 +921,12 @@ impl<'doc> DocumentMutator<'doc> {
             node.flags.set(NodeFlags::IS_IN_DOCUMENT, true);
             node.insert_damage(ALL_DAMAGE);
 
-            // If the node has an "id" attribute, store it in the ID map.
+            // If the node has an "id" attribute, store it in the ID map. Ids
+            // inside a shadow tree are not visible to the document.
             if let Some(id_attr) = node.attr(local_name!("id")).map(ToString::to_string) {
-                doc.add_to_id_map(&id_attr, node_id);
+                if !node.is_in_shadow_tree() {
+                    doc.add_to_id_map(&id_attr, node_id);
+                }
             }
 
             let node = &mut doc.nodes[node_id];
@@ -1090,8 +1119,7 @@ impl<'doc> DocumentMutator<'doc> {
             unreachable!();
         };
 
-        let guard = self.doc.guard.read();
-        self.doc.stylist.remove_stylesheet(stylesheet, &guard);
+        self.doc.unregister_stylesheet(node_id, stylesheet);
         self.doc
             .stylist
             .force_stylesheet_origins_dirty(OriginSet::all());

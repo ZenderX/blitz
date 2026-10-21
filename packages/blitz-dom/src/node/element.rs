@@ -9,6 +9,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use style::Atom;
+use style::author_styles::AuthorStyles;
 use style::parser::ParserContext;
 use style::properties::{Importance, PropertyDeclaration, PropertyId, SourcePropertyDeclaration};
 use style::stylesheets::{DocumentStyleSheet, Origin, UrlExtraData};
@@ -34,6 +35,7 @@ use super::{Attribute, Attributes};
 use crate::Document;
 use crate::layout::table::TableContext;
 use crate::node::{TextBrush, TextInputData, TextLayout};
+use crate::shadow::ShadowLink;
 
 #[cfg(feature = "custom-widget")]
 use super::custom_widget::CustomWidgetData;
@@ -80,6 +82,12 @@ pub struct ElementData {
 
     /// The element's template contents (\<template\> elements only)
     pub template_contents: Option<NodeId>,
+
+    /// Whether this element hosts a shadow root or is one
+    pub shadow: ShadowLink,
+
+    /// The author stylesheets scoped to this shadow tree (shadow roots only)
+    pub(crate) shadow_styles: Option<Box<AuthorStyles<DocumentStyleSheet>>>,
     // /// Whether the node is a [HTML integration point] (https://html.spec.whatwg.org/multipage/#html-integration-point)
     // pub mathml_annotation_xml_integration_point: bool,
 
@@ -255,7 +263,10 @@ impl Clone for ElementData {
             list_item_data: self.list_item_data.clone(),
             template_contents: self.template_contents,
 
-            // Runtime state: reset to defaults.
+            // Runtime state: reset to defaults. A clone has no shadow root: cloning
+            // a host must not share its root with the original.
+            shadow: ShadowLink::None,
+            shadow_styles: None,
             stylo_element_data: Default::default(),
             selector_flags: Cell::new(ElementSelectorFlags::empty()),
             guard: self.guard.clone(),
@@ -365,6 +376,8 @@ impl ElementData {
             list_item_data: None,
             special_data: SpecialElementData::None,
             template_contents: None,
+            shadow: ShadowLink::None,
+            shadow_styles: None,
             background_images: Vec::new(),
             mask_images: Vec::new(),
 
