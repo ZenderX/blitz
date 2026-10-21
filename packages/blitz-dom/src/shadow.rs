@@ -839,4 +839,154 @@ mod tests {
             "removing the sheet restores the first"
         );
     }
+
+    /// A host in the body whose shadow tree holds `<div part=…>` for each of `parts`.
+    fn host_with_parts(f: &mut Fixture, host_tag: &str, parts: &[&str]) -> (NodeId, NodeId) {
+        let host = f.element(host_tag, &[]);
+        f.append(f.body, &[host]);
+        let root = f.doc.attach_shadow_root(host).unwrap();
+        for part in parts {
+            let div = f.element("div", &[("part", part)]);
+            f.append(root, &[div]);
+        }
+        (host, root)
+    }
+
+    #[test]
+    fn part_rule_from_the_outer_tree_styles_the_part() {
+        let mut f = Fixture::new();
+        let body = f.body;
+        add_style(
+            &mut f,
+            body,
+            "x-host::part(label){height:33px} x-host::part(a b){height:44px}",
+        );
+        let (_, root) = host_with_parts(&mut f, "x-host", &["label", "plain", "a b c"]);
+        let bare = f.element("div", &[]);
+        f.append(root, &[bare]);
+        f.doc.resolve(0.0);
+
+        let divs = f.doc.nodes[root].children.clone();
+        assert_eq!(height(&f, divs[0]), 33.0, "part=label matches");
+        assert_eq!(height(&f, divs[1]), 0.0, "another part name does not");
+        assert_eq!(height(&f, divs[2]), 44.0, "::part(a b) needs both names");
+        assert_eq!(
+            height(&f, bare),
+            0.0,
+            "an element without part never matches"
+        );
+
+        f.doc.mutate().set_attribute(divs[1], el("part"), "label");
+        f.doc.resolve(0.0);
+        assert_eq!(height(&f, divs[1]), 33.0, "changing `part` restyles");
+    }
+
+    #[test]
+    fn exportparts_forwards_parts_through_nested_hosts() {
+        let mut f = Fixture::new();
+        let body = f.body;
+        add_style(
+            &mut f,
+            body,
+            "x-outer::part(outer){height:21px} x-outer::part(label){height:22px} \
+             x-outer::part(hidden){height:23px} x-outer::part(both){height:24px}",
+        );
+        let (outer, outer_root) = host_with_parts(&mut f, "x-outer", &[]);
+        let inner = f.element("x-inner", &[]);
+        f.append(outer_root, &[inner]);
+        let inner_root = f.doc.attach_shadow_root(inner).unwrap();
+        let mut parts = Vec::new();
+        for part in ["label", "hidden", "kept"] {
+            let div = f.element("div", &[("part", part)]);
+            f.append(inner_root, &[div]);
+            parts.push(div);
+        }
+        // `label` is renamed, `kept` is exported twice, `:` and empty entries are dropped
+        f.doc.mutate().set_attribute(
+            inner,
+            el("exportparts"),
+            "label:outer, kept:both, kept:label2, :, bad:",
+        );
+        f.doc
+            .mutate()
+            .set_attribute(outer, el("exportparts"), "outer, both, label2:label");
+        f.doc.resolve(0.0);
+
+        assert_eq!(
+            height(&f, parts[0]),
+            21.0,
+            "label:outer forwarded as `outer`"
+        );
+        assert_eq!(height(&f, parts[1]), 0.0, "an unexported part stays hidden");
+        assert_eq!(height(&f, parts[2]), 24.0, "kept -> both -> both");
+    }
+
+    #[test]
+    fn adopted_sheets_follow_the_trees_own_sheets() {
+        let mut f = Fixture::new();
+        let host = f.element("x-host", &[]);
+        let other = f.element("x-host", &[]);
+        f.append(f.body, &[host, other]);
+        let roots: Vec<NodeId> = [host, other]
+            .iter()
+            .map(|h| f.doc.attach_shadow_root(*h).unwrap())
+            .collect();
+        add_style(&mut f, roots[0], ":host{height:50px}");
+        let sheet = f.doc.create_adopted_stylesheet(":host{height:80px}");
+        f.doc.set_adopted_stylesheets(Some(roots[0]), &[sheet]);
+        f.doc.set_adopted_stylesheets(Some(roots[1]), &[sheet]);
+        f.doc.resolve(0.0);
+        assert_eq!(
+            height(&f, host),
+            80.0,
+            "adopted sheet beats the earlier <style>"
+        );
+        assert_eq!(height(&f, other), 80.0, "one sheet is shared by two roots");
+
+        // A <style> added later still sorts before the adopted sheet
+        add_style(&mut f, roots[0], ":host{height:60px}");
+        f.doc.resolve(0.0);
+        assert_eq!(height(&f, host), 80.0);
+
+        f.doc
+            .replace_adopted_stylesheet(sheet, ":host{height:90px}");
+        f.doc.resolve(0.0);
+        assert_eq!(height(&f, host), 90.0, "replace updates every adopter");
+        assert_eq!(height(&f, other), 90.0);
+
+        f.doc.set_adopted_stylesheets(Some(roots[0]), &[]);
+        f.doc.resolve(0.0);
+        assert_eq!(
+            height(&f, host),
+            60.0,
+            "dropping the list restores the <style>"
+        );
+        assert_eq!(height(&f, other), 90.0);
+
+        f.doc.release_adopted_stylesheet(sheet);
+        f.doc.resolve(0.0);
+        assert_eq!(height(&f, other), 0.0, "releasing removes it everywhere");
+    }
+
+    #[test]
+    fn adopted_document_sheets_apply_and_can_be_removed() {
+        let mut f = Fixture::new();
+        let body = f.body;
+        add_style(&mut f, body, "x-host{height:70px}");
+        let host = f.element("x-host", &[]);
+        f.append(f.body, &[host]);
+        let sheet = f.doc.create_adopted_stylesheet("x-host{height:77px}");
+        f.doc.set_adopted_stylesheets(None, &[sheet]);
+        f.doc.resolve(0.0);
+        assert_eq!(height(&f, host), 77.0);
+
+        f.doc
+            .replace_adopted_stylesheet(sheet, "x-host{height:78px}");
+        f.doc.resolve(0.0);
+        assert_eq!(height(&f, host), 78.0);
+
+        f.doc.set_adopted_stylesheets(None, &[]);
+        f.doc.resolve(0.0);
+        assert_eq!(height(&f, host), 70.0);
+    }
 }

@@ -194,6 +194,20 @@ impl crate::document::BaseDocument {
     }
 }
 
+/// The `(inner, outer)` pairs of an `exportparts` value: `ident` means
+/// `ident:ident`, and entries that are not one or two idents are dropped.
+fn exported_part_entries(value: &str) -> impl Iterator<Item = (&str, &str)> {
+    let is_ident =
+        |s: &str| !s.is_empty() && !s.contains(|c: char| c.is_ascii_whitespace() || c == ':');
+    value.split(',').filter_map(move |entry| {
+        let entry = entry.trim_ascii();
+        let (inner, outer) = entry
+            .split_once(':')
+            .map_or((entry, entry), |(i, o)| (i.trim_ascii(), o.trim_ascii()));
+        (is_ident(inner) && is_ident(outer)).then_some((inner, outer))
+    })
+}
+
 /// A handle to a node that Servo's style traits are implemented against
 ///
 /// Since BlitzNodes are not persistent (IE we don't keep the pointers around between frames), we choose to just implement
@@ -558,15 +572,22 @@ impl selectors::Element for BlitzNode<'_> {
         false
     }
 
+    // `name` is the outer name this host exports a part under; the result is the
+    // part's name inside the host's shadow tree.
     fn imported_part(
         &self,
-        _name: &<Self::Impl as selectors::SelectorImpl>::Identifier,
+        name: &<Self::Impl as selectors::SelectorImpl>::Identifier,
     ) -> Option<<Self::Impl as selectors::SelectorImpl>::Identifier> {
-        None
+        let value = self.data.attr(LocalName::from("exportparts"))?;
+        exported_part_entries(value)
+            .find(|(_, outer)| *outer == &*name.0)
+            .map(|(inner, _)| GenericAtomIdent(Atom::from(inner)))
     }
 
-    fn is_part(&self, _name: &<Self::Impl as selectors::SelectorImpl>::Identifier) -> bool {
-        false
+    fn is_part(&self, name: &<Self::Impl as selectors::SelectorImpl>::Identifier) -> bool {
+        self.data
+            .attr(local_name!("part"))
+            .is_some_and(|parts| parts.split_ascii_whitespace().any(|part| part == &*name.0))
     }
 
     fn is_empty(&self) -> bool {
@@ -654,11 +675,35 @@ impl<'a> TElement for BlitzNode<'a> {
     }
 
     fn has_part_attr(&self) -> bool {
-        false
+        self.data.attr(local_name!("part")).is_some()
     }
 
     fn exports_any_part(&self) -> bool {
-        false
+        self.data.attr(LocalName::from("exportparts")).is_some()
+    }
+
+    fn each_part<F>(&self, mut callback: F)
+    where
+        F: FnMut(&AtomIdent),
+    {
+        if let Some(parts) = self.data.attr(local_name!("part")) {
+            for part in parts.split_ascii_whitespace() {
+                callback(&GenericAtomIdent(Atom::from(part)));
+            }
+        }
+    }
+
+    // Calls back with every outer name this host exports the part `name` under.
+    fn each_exported_part<F>(&self, name: &AtomIdent, mut callback: F)
+    where
+        F: FnMut(&AtomIdent),
+    {
+        let Some(value) = self.data.attr(LocalName::from("exportparts")) else {
+            return;
+        };
+        for (_, outer) in exported_part_entries(value).filter(|(inner, _)| *inner == &*name.0) {
+            callback(&GenericAtomIdent(Atom::from(outer)));
+        }
     }
 
     fn id(&self) -> Option<&style::Atom> {

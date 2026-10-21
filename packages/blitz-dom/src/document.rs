@@ -63,7 +63,9 @@ use style::{
     media_queries::MediaList,
     selector_parser::SnapshotMap,
     shared_lock::{SharedRwLock, StylesheetGuards},
-    stylesheets::{AllowImportRules, CustomMediaMap, DocumentStyleSheet, Origin, Stylesheet},
+    stylesheets::{
+        AllowImportRules, CustomMediaMap, DocumentStyleSheet, Origin, OriginSet, Stylesheet,
+    },
     stylist::Stylist,
 };
 use style_dom::ElementState;
@@ -194,6 +196,11 @@ pub enum DocumentEvent {
     },
 }
 
+/// A constructed stylesheet that can be adopted by the document and any number
+/// of shadow roots (`adoptedStyleSheets`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct AdoptedSheetId(u64);
+
 pub struct BaseDocument {
     /// ID of the document
     id: usize,
@@ -306,6 +313,12 @@ pub struct BaseDocument {
     pub(crate) shadow_sheet_roots: HashMap<NodeId, NodeId>,
     /// Shadow roots whose sheets changed since their cascade data was last rebuilt
     pub(crate) dirty_shadow_style_roots: BTreeSet<NodeId>,
+    /// Constructed (adopted) stylesheets by id; see [`AdoptedSheetId`]
+    pub(crate) adopted_sheets: HashMap<AdoptedSheetId, DocumentStyleSheet>,
+    /// The adopted sheets of each tree in order: `None` is the document, `Some` a
+    /// shadow root. They sit after the tree's own `<style>`/`<link>` sheets.
+    pub(crate) adopted_by_tree: HashMap<Option<NodeId>, Vec<AdoptedSheetId>>,
+    pub(crate) next_adopted_sheet_id: u64,
     /// Stylesheets added by the useragent
     /// where the key is the hashed CSS
     pub(crate) ua_stylesheets: HashMap<String, DocumentStyleSheet>,
@@ -591,6 +604,9 @@ impl BaseDocument {
             nodes_to_stylesheet: BTreeMap::new(),
             shadow_sheet_roots: HashMap::new(),
             dirty_shadow_style_roots: BTreeSet::new(),
+            adopted_sheets: HashMap::new(),
+            adopted_by_tree: HashMap::new(),
+            next_adopted_sheet_id: 0,
             font_ctx,
             #[cfg(feature = "parallel-construct")]
             thread_font_contexts: ThreadLocal::new(),
@@ -1353,21 +1369,40 @@ impl BaseDocument {
             .nodes_to_stylesheet
             .range((Bound::Excluded(node_id), Bound::Unbounded))
             .find(|(id, _)| self.shadow_sheet_roots.get(id).copied() == root_id)
-            .map(|(_, sheet)| sheet.clone());
+            .map(|(_, sheet)| sheet.clone())
+            // Adopted sheets stay after the tree's own sheets
+            .or_else(|| self.first_adopted_sheet(root_id));
 
-        let guard = self.guard.read();
-        let Some(root_id) = root_id else {
-            match insertion_point {
-                Some(before) => self
-                    .stylist
-                    .insert_stylesheet_before(stylesheet, before, &guard),
-                None => self.stylist.append_stylesheet(stylesheet, &guard),
+        if self.insert_sheet_in_tree(root_id, stylesheet, insertion_point) {
+            if let Some(root_id) = root_id {
+                self.shadow_sheet_roots.insert(node_id, root_id);
             }
-            return;
+        }
+    }
+
+    /// Register `sheet` with the document (`tree` is `None`) or a shadow root,
+    /// before `before` or at the end. Returns false if the root is gone.
+    fn insert_sheet_in_tree(
+        &mut self,
+        tree: Option<NodeId>,
+        sheet: DocumentStyleSheet,
+        before: Option<DocumentStyleSheet>,
+    ) -> bool {
+        let guard = self.guard.read();
+        let Some(root_id) = tree else {
+            match before {
+                Some(before) => self.stylist.insert_stylesheet_before(sheet, before, &guard),
+                None => self.stylist.append_stylesheet(sheet, &guard),
+            }
+            return true;
         };
 
-        let Some(element) = self.nodes[root_id].element_data_mut() else {
-            return;
+        let Some(element) = self
+            .nodes
+            .get_mut(root_id)
+            .and_then(|root| root.element_data_mut())
+        else {
+            return false;
         };
         // No device: invalidations are not collected for shadow trees, and a changed
         // sheet restyles the whole host subtree instead (see `flush_shadow_styles`).
@@ -1376,20 +1411,20 @@ impl BaseDocument {
             .get_or_insert_with(|| Box::new(AuthorStyles::new()))
             .stylesheets;
         let custom_media = CustomMediaMap::default();
-        match insertion_point {
+        match before {
             Some(before) => {
-                sheets.insert_stylesheet_before(None, &custom_media, stylesheet, before, &guard)
+                sheets.insert_stylesheet_before(None, &custom_media, sheet, before, &guard)
             }
-            None => sheets.append_stylesheet(None, &custom_media, stylesheet, &guard),
+            None => sheets.append_stylesheet(None, &custom_media, sheet, &guard),
         }
-        self.shadow_sheet_roots.insert(node_id, root_id);
         self.dirty_shadow_style_roots.insert(root_id);
+        true
     }
 
-    /// Remove the sheet of a `<style>`/`<link>` node from wherever it was registered.
-    pub(crate) fn unregister_stylesheet(&mut self, node_id: NodeId, sheet: DocumentStyleSheet) {
+    /// Remove `sheet` from the document (`tree` is `None`) or a shadow root.
+    fn remove_sheet_from_tree(&mut self, tree: Option<NodeId>, sheet: DocumentStyleSheet) {
         let guard = self.guard.read();
-        let Some(root_id) = self.shadow_sheet_roots.remove(&node_id) else {
+        let Some(root_id) = tree else {
             self.stylist.remove_stylesheet(sheet, &guard);
             return;
         };
@@ -1407,6 +1442,133 @@ impl BaseDocument {
             .stylesheets
             .remove_stylesheet(None, &CustomMediaMap::default(), sheet, &guard);
         self.dirty_shadow_style_roots.insert(root_id);
+    }
+
+    /// Remove the sheet of a `<style>`/`<link>` node from wherever it was registered.
+    pub(crate) fn unregister_stylesheet(&mut self, node_id: NodeId, sheet: DocumentStyleSheet) {
+        let tree = self.shadow_sheet_roots.remove(&node_id);
+        self.remove_sheet_from_tree(tree, sheet);
+    }
+
+    fn first_adopted_sheet(&self, tree: Option<NodeId>) -> Option<DocumentStyleSheet> {
+        let id = self.adopted_by_tree.get(&tree)?.first()?;
+        self.adopted_sheets.get(id).cloned()
+    }
+
+    /// Parse `css` into a constructed stylesheet that trees can adopt with
+    /// [`Self::set_adopted_stylesheets`]. One sheet can be adopted by many trees.
+    pub fn create_adopted_stylesheet(&mut self, css: &str) -> AdoptedSheetId {
+        let id = AdoptedSheetId(self.next_adopted_sheet_id);
+        self.next_adopted_sheet_id += 1;
+        let sheet = self.make_adopted_stylesheet(css);
+        self.adopted_sheets.insert(id, sheet);
+        id
+    }
+
+    fn make_adopted_stylesheet(&self, css: &str) -> DocumentStyleSheet {
+        let sheet = self.make_stylesheet(css, Origin::Author);
+        crate::net::fetch_font_face(
+            self.tx.clone(),
+            self.id,
+            None,
+            &sheet.0,
+            &self.net_provider,
+            &self.shell_provider,
+            &self.guard.read(),
+            self.abort_signal.as_ref(),
+        );
+        sheet
+    }
+
+    /// Replace the rules of an adopted sheet in every tree that adopted it.
+    pub fn replace_adopted_stylesheet(&mut self, id: AdoptedSheetId, css: &str) {
+        if !self.adopted_sheets.contains_key(&id) {
+            return;
+        }
+        let trees = self.trees_adopting(id);
+        for tree in &trees {
+            self.detach_adopted(*tree);
+        }
+        let sheet = self.make_adopted_stylesheet(css);
+        self.adopted_sheets.insert(id, sheet);
+        for tree in &trees {
+            self.attach_adopted(*tree);
+        }
+    }
+
+    /// Forget an adopted sheet, removing it from every tree that adopted it.
+    pub fn release_adopted_stylesheet(&mut self, id: AdoptedSheetId) {
+        let trees = self.trees_adopting(id);
+        for tree in &trees {
+            self.detach_adopted(*tree);
+            if let Some(list) = self.adopted_by_tree.get_mut(tree) {
+                list.retain(|other| *other != id);
+            }
+        }
+        self.adopted_sheets.remove(&id);
+        for tree in &trees {
+            self.attach_adopted(*tree);
+        }
+    }
+
+    /// Set the adopted sheets of the document (`tree` is `None`) or of a shadow
+    /// root, replacing the previous list. They apply after the tree's own sheets,
+    /// in the given order. Unknown ids and repeats of an id are skipped.
+    pub fn set_adopted_stylesheets(&mut self, tree: Option<NodeId>, ids: &[AdoptedSheetId]) {
+        self.detach_adopted(tree);
+        let mut list: Vec<AdoptedSheetId> = Vec::with_capacity(ids.len());
+        for id in ids {
+            if self.adopted_sheets.contains_key(id) && !list.contains(id) {
+                list.push(*id);
+            }
+        }
+        if list.is_empty() {
+            self.adopted_by_tree.remove(&tree);
+        } else {
+            self.adopted_by_tree.insert(tree, list);
+        }
+        self.attach_adopted(tree);
+    }
+
+    fn trees_adopting(&self, id: AdoptedSheetId) -> Vec<Option<NodeId>> {
+        self.adopted_by_tree
+            .iter()
+            .filter(|(_, list)| list.contains(&id))
+            .map(|(tree, _)| *tree)
+            .collect()
+    }
+
+    /// Unregister the adopted sheets of `tree` from the style system, keeping the list.
+    fn detach_adopted(&mut self, tree: Option<NodeId>) {
+        let sheets: Vec<DocumentStyleSheet> = self
+            .adopted_by_tree
+            .get(&tree)
+            .into_iter()
+            .flatten()
+            .filter_map(|id| self.adopted_sheets.get(id).cloned())
+            .collect();
+        let is_document_changed = tree.is_none() && !sheets.is_empty();
+        for sheet in sheets {
+            self.remove_sheet_from_tree(tree, sheet);
+        }
+        if is_document_changed {
+            self.stylist
+                .force_stylesheet_origins_dirty(OriginSet::all());
+        }
+    }
+
+    /// Register the adopted sheets of `tree` with the style system, in order.
+    fn attach_adopted(&mut self, tree: Option<NodeId>) {
+        let sheets: Vec<DocumentStyleSheet> = self
+            .adopted_by_tree
+            .get(&tree)
+            .into_iter()
+            .flatten()
+            .filter_map(|id| self.adopted_sheets.get(id).cloned())
+            .collect();
+        for sheet in sheets {
+            self.insert_sheet_in_tree(tree, sheet, None);
+        }
     }
 
     /// Rebuild the cascade data of every shadow root whose sheets changed and
