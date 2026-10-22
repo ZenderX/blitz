@@ -1255,7 +1255,7 @@ impl<'a> TElement for BlitzNode<'a> {
     where
         F: FnMut(&AtomIdent),
     {
-        todo!()
+        // No custom states are supported; stylo's :has() dependency collection calls this per element.
     }
 
     fn has_selector_flags(&self, flags: ElementSelectorFlags) -> bool {
