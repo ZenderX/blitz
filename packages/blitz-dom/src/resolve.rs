@@ -387,6 +387,7 @@ impl BaseDocument {
         // println!("\n\nRESOLVE LAYOUT\n===========\n");
 
         taffy::compute_root_layout(self, root_element_id, available_space);
+        self.layout_fixed_boxes();
         taffy::round_layout(self, root_element_id);
 
         // println!("\n\n");
