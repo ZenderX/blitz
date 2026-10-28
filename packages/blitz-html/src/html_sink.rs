@@ -106,7 +106,7 @@ impl<'m, 'doc> DocumentHtmlParser<'m, 'doc> {
                 tokenizer: TokenizerOpts::default(),
                 tree_builder: TreeBuilderOpts {
                     exact_errors: false,
-                    scripting_enabled: false, // Enables parsing of <noscript> tags
+                    scripting_enabled: true, // Loki is always JS-capable: <noscript> content parses as raw text, not live DOM
                     iframe_srcdoc: false,
                     drop_doctype: true,
                     quirks_mode: QuirksMode::NoQuirks,
@@ -146,7 +146,7 @@ impl<'m, 'doc> DocumentHtmlParser<'m, 'doc> {
             tokenizer: TokenizerOpts::default(),
             tree_builder: TreeBuilderOpts {
                 exact_errors: false,
-                scripting_enabled: false, // Enables parsing of <noscript> tags
+                scripting_enabled: true, // Loki is always JS-capable: <noscript> content parses as raw text, not live DOM
                 iframe_srcdoc: false,
                 drop_doctype: true,
                 quirks_mode: QuirksMode::NoQuirks,
@@ -329,4 +329,50 @@ fn parses_some_html() {
     doc.print_tree()
 
     // Now our tree should have some nodes in it
+}
+
+#[test]
+fn noscript_content_is_parsed_as_raw_text() {
+    use blitz_dom::{BaseDocument, DocumentConfig};
+
+    let html = "<!DOCTYPE html><html><body><noscript><b>bold</b></noscript></body></html>";
+    let mut doc = BaseDocument::new(DocumentConfig::default());
+    let mut mutr = doc.mutate();
+    DocumentHtmlParser::parse_into_mutator(&mut mutr, html);
+    drop(mutr);
+
+    // Walk root -> html -> body -> noscript, matching by tag name.
+    fn child_element_named<'a>(node: &'a blitz_dom::Node, name: &str) -> &'a blitz_dom::Node {
+        node.children
+            .iter()
+            .find_map(|id| {
+                let child = node.with(*id);
+                (child.is_element()
+                    && &*child.element_data().unwrap().name.local == name)
+                .then_some(child)
+            })
+            .unwrap_or_else(|| panic!("expected a <{name}> element child"))
+    }
+    let root = doc.root_node();
+    let html_el = child_element_named(root, "html");
+    let body = child_element_named(html_el, "body");
+    let noscript = child_element_named(body, "noscript");
+
+    // With scripting enabled the <noscript> content must be a single raw text
+    // node, not a live tree of elements.
+    assert_eq!(
+        noscript.children.len(),
+        1,
+        "<noscript> must contain exactly one node"
+    );
+    let content = noscript.with(noscript.children[0]);
+    assert!(
+        content.is_text_node(),
+        "<noscript> content must be a text node, not live elements"
+    );
+    assert_eq!(
+        content.text_data().unwrap().content,
+        "<b>bold</b>",
+        "<noscript> content must be the raw markup, verbatim"
+    );
 }
