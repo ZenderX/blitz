@@ -1067,11 +1067,9 @@ slot {
     }
 }
 
-/* Hide noscript elements if scripting is enabled */
-@media (scripting) {
-    noscript {
-        display: none !important;
-    }
+/* Hide noscript elements: the embedder is always JS-capable */
+noscript {
+    display: none !important;
 }
 
 @media print {
