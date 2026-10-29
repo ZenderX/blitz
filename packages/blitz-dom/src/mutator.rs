@@ -356,6 +356,14 @@ impl DocumentMutator<'_> {
             return;
         }
 
+        // An <img> src must reach the net provider even while the node is
+        // detached: `new Image()` is never attached, and its load/error event
+        // is the only signal that settles the image.
+        if (tag, attr) == tag_and_attr!("img", "src") {
+            self.load_image(node_id);
+            return;
+        }
+
         // If node if not in the document, then don't apply any special behaviours
         // and simply set the attribute value
         if !node.flags.is_in_document() {
@@ -364,8 +372,6 @@ impl DocumentMutator<'_> {
 
         if (tag, attr) == tag_and_attr!("input", "checked") {
             set_input_checked_state(element, value.to_string());
-        } else if (tag, attr) == tag_and_attr!("img", "src") {
-            self.load_image(node_id);
         } else if (tag, attr) == tag_and_attr!("canvas", "src") {
             self.load_custom_paint_src(node_id);
         } else if (tag, attr) == tag_and_attr!("link", "href") {
@@ -1345,9 +1351,11 @@ mod test {
 
     use std::sync::{
         Arc,
+        Mutex,
         atomic::{AtomicUsize, Ordering},
     };
 
+    use blitz_traits::net::{NetHandler, NetProvider, Request};
     use blitz_traits::shell::{ColorScheme, ShellProvider, Viewport};
 
     use crate::{Attribute, BaseDocument, DocumentConfig, ElementData, NodeData, qual_name};
@@ -1718,6 +1726,48 @@ mod test {
                 .location
                 .x,
             120.0
+        );
+    }
+
+    /// Records every fetch handed to the net provider, so a test can assert
+    /// whether a given mutation reached the network layer.
+    struct RecordingNetProvider(Mutex<Vec<Request>>);
+    impl NetProvider for RecordingNetProvider {
+        fn fetch(&self, _doc_id: usize, request: Request, _handler: Box<dyn NetHandler>) {
+            self.0.lock().unwrap().push(request);
+        }
+    }
+
+    /// A detached `<img>` (e.g. `new Image()`) must still reach the net
+    /// provider when its `src` is set: the load/error event is the only
+    /// signal that settles the image, and the node is never attached to the
+    /// document. Regression test for the `set_attribute` early return that
+    /// used to skip `load_image` for out-of-document nodes.
+    #[test]
+    fn set_attribute_on_detached_img_reaches_net_provider() {
+        let recorder = Arc::new(RecordingNetProvider(Mutex::new(Vec::new())));
+        let net_provider: Arc<dyn NetProvider> = recorder.clone();
+        let mut document = BaseDocument::new(DocumentConfig {
+            net_provider: Some(net_provider),
+            ..Default::default()
+        });
+
+        let mut mutator = document.mutate();
+        let img_id = mutator.create_element(qual_name!("img"), vec![]);
+        // The img is never appended to the document (detached).
+        mutator.set_attribute(img_id, qual_name!("src"), "https://example.com/detached.png");
+        drop(mutator);
+
+        let requests = recorder.0.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "a detached <img> src must trigger exactly one fetch"
+        );
+        assert_eq!(
+            requests[0].url.as_str(),
+            "https://example.com/detached.png",
+            "the fetch must target the img src"
         );
     }
 }
