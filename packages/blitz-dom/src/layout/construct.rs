@@ -4,8 +4,7 @@ use std::sync::Arc;
 
 use markup5ever::{QualName, local_name, ns};
 use parley::{
-    FontContext, InlineBox, InlineBoxKind, LayoutContext, StyleProperty, TreeBuilder,
-    WhiteSpaceCollapse,
+    FontContext, InlineBox, InlineBoxKind, LayoutContext, TreeBuilder, WhiteSpaceCollapse,
 };
 use style::{
     computed_values::position::T as PositionProperty,
@@ -498,6 +497,11 @@ fn collect_layout_children_with_wrap(
             }
         }
 
+        // A select is a leaf: paint draws its selected option's label, so no option gets a box.
+        if tag_name == "select" {
+            return;
+        }
+
         #[cfg(feature = "svg")]
         if matches!(tag_name, "svg") {
             // Remove contruction damage from subtree
@@ -867,11 +871,7 @@ fn collect_complex_layout_children(
 
 fn create_text_editor(doc: &mut BaseDocument, input_element_id: NodeId, is_multiline: bool) {
     let node = &mut doc.nodes[input_element_id];
-    let parley_style = node
-        .primary_styles()
-        .as_ref()
-        .map(|s| stylo_to_parley::style(node.id, s))
-        .unwrap_or_default();
+    let control_text_styles = stylo_to_parley::control_text_styles(node);
 
     let element = &mut node.data.downcast_element_mut().unwrap();
     if !matches!(element.special_data, SpecialElementData::TextInput(_)) {
@@ -891,9 +891,9 @@ fn create_text_editor(doc: &mut BaseDocument, input_element_id: NodeId, is_multi
 
     let styles = editor.edit_styles();
     styles.retain(|_| false);
-    styles.insert(StyleProperty::FontSize(parley_style.font_size));
-    styles.insert(StyleProperty::LineHeight(parley_style.line_height));
-    styles.insert(StyleProperty::Brush(parley_style.brush));
+    for style in control_text_styles {
+        styles.insert(style);
+    }
 
     editor.refresh_layout(&mut doc.font_ctx.lock().unwrap(), &mut doc.layout_ctx);
 }

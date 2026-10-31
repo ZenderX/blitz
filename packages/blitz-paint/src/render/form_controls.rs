@@ -1,8 +1,8 @@
 use super::ElementCx;
 use crate::color::{Color, ToColorColor as _};
 use anyrender::PaintScene;
-use blitz_dom::local_name;
-use kurbo::{Affine, BezPath, Cap, Circle, Join, Point, RoundedRect, Stroke, Vec2};
+use blitz_dom::{SELECT_ARROW_WIDTH_EM, local_name};
+use kurbo::{Affine, BezPath, Cap, Circle, Join, Point, Rect, RoundedRect, Stroke, Vec2};
 use peniko::Fill;
 use style::dom::TElement as _;
 
@@ -42,6 +42,62 @@ impl ElementCx<'_, '_> {
             }
             _ => {}
         }
+    }
+
+    /// A drop-down `<select>`: the selected option's label, vertically centred and clipped
+    /// short of the arrow box, then a down-pointing arrow. The box itself is the UA sheet's
+    /// border and background.
+    pub(super) fn draw_select(&self, scene: &mut impl PaintScene) {
+        if self.node.local_name() != "select" {
+            return;
+        }
+        let dom = self.context.dom;
+        let content = self.frame.content_box;
+        let font_size = self.style.clone_font_size().used_size().px() as f64 * self.scale;
+        let arrow_width = font_size * f64::from(SELECT_ARROW_WIDTH_EM);
+        let label_box = Rect::new(
+            content.x0,
+            content.y0,
+            (content.x1 - arrow_width).max(content.x0),
+            content.y1,
+        );
+
+        if let Some(option_id) = dom.selected_option(self.node.id) {
+            let layout = dom.layout_control_text(self.node.id, &dom.option_label(option_id));
+            let y = content.y0 + ((content.height() - f64::from(layout.height())) / 2.0).max(0.0);
+            let text_transform = self.transform * Affine::translate((content.x0, y));
+            let overflows = f64::from(layout.full_width()) > label_box.width();
+            self.context.layer_manager.maybe_with_layer(
+                scene,
+                overflows,
+                1.0,
+                self.transform,
+                &label_box,
+                None,
+                None,
+                |scene| {
+                    crate::text::stroke_text(
+                        scene,
+                        layout.lines(),
+                        dom,
+                        text_transform,
+                        self.scale,
+                        self.node.id,
+                        &mut self.context.draw_text_context.borrow_mut(),
+                    );
+                },
+            );
+        }
+
+        let center = Point::new(content.x1 - arrow_width / 2.0, content.center().y);
+        let half_width = arrow_width / 4.0;
+        let mut arrow = BezPath::new();
+        arrow.move_to((center.x - half_width, center.y - half_width / 2.0));
+        arrow.line_to((center.x + half_width, center.y - half_width / 2.0));
+        arrow.line_to((center.x, center.y + half_width / 2.0));
+        arrow.close_path();
+        let color = self.style.clone_color().as_srgb_color();
+        scene.fill(Fill::NonZero, self.transform, color, None, &arrow);
     }
 }
 

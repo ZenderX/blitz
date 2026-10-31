@@ -35,6 +35,7 @@ use super::{Attribute, Attributes};
 use crate::Document;
 use crate::layout::table::TableContext;
 use crate::node::{TextBrush, TextInputData, TextLayout};
+use crate::select_element::SelectDisplay;
 use crate::shadow::ShadowLink;
 
 #[cfg(feature = "custom-widget")]
@@ -85,6 +86,9 @@ pub struct ElementData {
 
     /// Whether this element hosts a shadow root or is one
     pub shadow: ShadowLink,
+
+    /// What a `<select>` displays, as the host last set it (`Markup` for any other element)
+    pub(crate) select_display: SelectDisplay,
 
     /// The author stylesheets scoped to this shadow tree (shadow roots only)
     pub(crate) shadow_styles: Option<Box<AuthorStyles<DocumentStyleSheet>>>,
@@ -266,6 +270,8 @@ impl Clone for ElementData {
             // Runtime state: reset to defaults. A clone has no shadow root: cloning
             // a host must not share its root with the original.
             shadow: ShadowLink::None,
+            // A host override names the original's option, never one of the clone's.
+            select_display: SelectDisplay::Markup,
             shadow_styles: None,
             stylo_element_data: Default::default(),
             selector_flags: Cell::new(ElementSelectorFlags::empty()),
@@ -377,6 +383,7 @@ impl ElementData {
             special_data: SpecialElementData::None,
             template_contents: None,
             shadow: ShadowLink::None,
+            select_display: SelectDisplay::Markup,
             shadow_styles: None,
             background_images: Vec::new(),
             mask_images: Vec::new(),

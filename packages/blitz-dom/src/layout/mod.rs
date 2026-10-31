@@ -88,6 +88,8 @@ impl BaseDocument {
         inputs: taffy::tree::LayoutInput,
         block_ctx: Option<&mut BlockContext<'_>>,
     ) -> taffy::tree::LayoutOutput {
+        // Shaped before the node is borrowed: measuring a select's labels reads its options.
+        let select_label_width = self.select_label_width(dom_node_id(node_id));
         let node = &mut self.nodes[dom_node_id(node_id)];
 
         let font_styles = node.primary_styles().map(|style| {
@@ -210,6 +212,19 @@ impl BaseDocument {
                         }
                         _ => {}
                     }
+                }
+
+                if let Some(label_width) = select_label_width {
+                    let arrow_width = font_size.unwrap_or(16.0) * crate::SELECT_ARROW_WIDTH_EM;
+                    return compute_leaf_layout(
+                        inputs,
+                        node.style(),
+                        resolve_calc_value,
+                        |_known_size, _available_space| taffy::Size {
+                            width: label_width + arrow_width,
+                            height: resolved_line_height.unwrap_or(16.0),
+                        },
+                    );
                 }
 
                 if is_replaced_element(&element_data.name.local) {

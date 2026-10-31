@@ -20,8 +20,8 @@ use crate::text::DrawTextContext;
 use crate::{CustomWidgetSceneMap, SELECTION_COLOR};
 use anyrender::{PaintScene, Scene};
 use blitz_dom::node::{
-    ListItemLayout, ListItemLayoutPosition, Marker, NodeData, RasterImageData, TextInputData,
-    TextNodeData,
+    ListItemLayout, ListItemLayoutPosition, Marker, NodeData, RasterImageData, TextBrush,
+    TextInputData, TextNodeData,
 };
 use blitz_dom::{BaseDocument, ElementData, Node, NodeId, local_name};
 use blitz_traits::devtools::DevtoolSettings;
@@ -41,6 +41,7 @@ use style::{
 };
 
 use kurbo::{self, Affine, Insets, Point, Rect, Shape, Size, Stroke, Vec2};
+use parley::{Cursor, Selection};
 use peniko::{self, Fill, ImageData, ImageSampler};
 use style::values::generics::color::GenericColor;
 use taffy::Layout;
@@ -534,6 +535,7 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                                 cx.draw_custom_widget(scene);
                                 cx.draw_sub_document(scene);
                                 cx.draw_input(scene);
+                                cx.draw_select(scene);
                                 cx.draw_text_input_text(scene, content_position);
                                 cx.draw_inline_layout(scene, content_position);
                                 cx.draw_marker(scene, content_position);
@@ -673,6 +675,23 @@ struct ElementCx<'dom, 'a> {
 /// Converts parley BoundingBox into peniko Rect
 fn convert_rect(rect: &parley::BoundingBox) -> kurbo::Rect {
     peniko::kurbo::Rect::new(rect.x0, rect.y0, rect.x1, rect.y1)
+}
+
+/// What a password input paints for each code point of its value.
+const PASSWORD_MASK: char = '\u{2022}';
+
+/// Placeholder text opacity: Firefox's `::placeholder { opacity: 0.54 }`, which over black
+/// text matches Chrome's `#757575` placeholder colour.
+const PLACEHOLDER_OPACITY: f32 = 0.54;
+
+/// The cursor on a password mask at the same code point as `cursor` is on the real `text`.
+fn mask_cursor(text: &str, mask: &parley::Layout<TextBrush>, cursor: Cursor) -> Cursor {
+    let code_points = text[..cursor.index()].chars().count();
+    Cursor::from_byte_index(
+        mask,
+        code_points * PASSWORD_MASK.len_utf8(),
+        cursor.affinity(),
+    )
 }
 
 impl ElementCx<'_, '_> {
@@ -872,9 +891,50 @@ impl ElementCx<'_, '_> {
             let transform = self.transform
                 * Affine::translate((pos.x * self.scale - scroll_x, pos.y * self.scale - scroll_y));
 
+            let editor = &input_data.editor;
+            let text = editor.raw_text();
+            let dom = self.context.dom;
+            let is_password = self
+                .node
+                .attr(local_name!("type"))
+                .is_some_and(|t| t.eq_ignore_ascii_case("password"));
+            // The editor keeps the real value; only the painted text is masked.
+            let mask = (is_password && !text.is_empty()).then(|| {
+                let bullets = PASSWORD_MASK.to_string().repeat(text.chars().count());
+                dom.layout_control_text(self.node.id, &bullets)
+            });
+            let placeholder = self
+                .node
+                .attr(local_name!("placeholder"))
+                .filter(|placeholder| text.is_empty() && !placeholder.is_empty())
+                .map(|placeholder| {
+                    // A single-line input shows its placeholder with line breaks stripped.
+                    let placeholder = if input_data.is_multiline {
+                        placeholder.to_string()
+                    } else {
+                        placeholder.replace(['\r', '\n'], "")
+                    };
+                    dom.layout_control_text(self.node.id, &placeholder)
+                });
+
             if self.node.is_focussed() {
+                let (selection_rects, caret) = match &mask {
+                    // Caret and selection keep their code point offsets, measured on the bullets.
+                    Some(mask) => {
+                        let selection = editor.raw_selection();
+                        let masked = Selection::new(
+                            mask_cursor(text, mask, selection.anchor()),
+                            mask_cursor(text, mask, selection.focus()),
+                        );
+                        let caret = editor
+                            .cursor_geometry(1.5)
+                            .map(|_| masked.focus().geometry(mask, 1.5));
+                        (masked.geometry(mask), caret)
+                    }
+                    None => (editor.selection_geometry(), editor.cursor_geometry(1.5)),
+                };
                 // Render selection/caret
-                for (rect, _line_idx) in input_data.editor.selection_geometry().iter() {
+                for (rect, _line_idx) in selection_rects.iter() {
                     scene.fill(
                         Fill::NonZero,
                         transform,
@@ -883,7 +943,7 @@ impl ElementCx<'_, '_> {
                         &convert_rect(rect),
                     );
                 }
-                if let Some(cursor) = input_data.editor.cursor_geometry(1.5) {
+                if let Some(cursor) = caret {
                     let color = self.style.get_inherited_text().color;
                     let caret_color = match &self.style.get_inherited_ui().caret_color.0 {
                         ColorOrAuto::Auto => color,
@@ -901,15 +961,30 @@ impl ElementCx<'_, '_> {
             }
 
             // Render text
-            let mut draw_text_context = self.context.draw_text_context.borrow_mut();
-            crate::text::stroke_text(
+            let (layout, opacity) = match (&mask, &placeholder) {
+                (Some(mask), _) => (mask, 1.0),
+                (None, Some(placeholder)) => (placeholder, PLACEHOLDER_OPACITY),
+                (None, None) => (editor.try_layout().unwrap(), 1.0),
+            };
+            self.context.layer_manager.maybe_with_layer(
                 scene,
-                input_data.editor.try_layout().unwrap().lines(),
-                self.context.dom,
-                transform,
-                self.scale,
-                self.node.id,
-                &mut draw_text_context,
+                opacity < 1.0,
+                opacity,
+                self.transform,
+                &self.frame.content_box,
+                None,
+                None,
+                |scene| {
+                    crate::text::stroke_text(
+                        scene,
+                        layout.lines(),
+                        dom,
+                        transform,
+                        self.scale,
+                        self.node.id,
+                        &mut self.context.draw_text_context.borrow_mut(),
+                    );
+                },
             );
         }
     }
