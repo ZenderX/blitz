@@ -54,6 +54,8 @@ mod query_selector;
 mod resolve;
 /// Scrolling of nodes and the viewport, and scroll animations.
 mod scrolling;
+/// What a drop-down `<select>` displays.
+mod select_element;
 mod selection;
 /// Shadow roots, slot assignment and the flat tree.
 mod shadow;
@@ -91,6 +93,7 @@ pub use mutator::DocumentMutator;
 pub use node::{Attribute, DocumentData, ElementData, Node, NodeData, TextNodeData};
 pub use parley::FontContext;
 pub use scrolling::{ScrollBehavior, ScrollLogicalPosition};
+pub use select_element::{SELECT_ARROW_WIDTH_EM, SelectDisplay};
 pub use shadow::{AttachShadowError, ShadowLink};
 pub use tree::NodeTree;
 

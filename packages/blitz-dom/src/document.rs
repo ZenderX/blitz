@@ -2755,6 +2755,28 @@ impl BaseDocument {
         }
     }
 
+    /// Shape `text` unwrapped, in the control text styles of `node_id` at the viewport
+    /// scale: text a form control paints that no editor or inline layout holds (a
+    /// placeholder, a password mask, a `<select>`'s label).
+    pub fn layout_control_text(&self, node_id: NodeId, text: &str) -> parley::Layout<TextBrush> {
+        let styles = crate::stylo_to_parley::control_text_styles(&self.nodes[node_id]);
+        let mut font_ctx = self.font_ctx.lock().unwrap();
+        // Paint holds the document immutably, so this cannot borrow `self.layout_ctx`.
+        let mut layout_ctx = parley::LayoutContext::new();
+        let mut builder =
+            layout_ctx.ranged_builder(&mut font_ctx, text, self.viewport.scale(), true);
+        for style in styles {
+            builder.push_default(style);
+        }
+        let mut layout = builder.build(text);
+        layout.break_all_lines(None);
+        layout.align(
+            parley::Alignment::Start,
+            parley::AlignmentOptions::default(),
+        );
+        layout
+    }
+
     /// Recompute the scroll offset of the text input at `node_id` (if any) so that its caret
     /// remains visible within the input's content box.
     pub(crate) fn clamp_text_input_scroll(&mut self, node_id: NodeId) {

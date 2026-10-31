@@ -4,6 +4,7 @@ use std::borrow::Cow;
 
 use style::values::computed::Length;
 
+use crate::Node;
 use crate::node::TextBrush;
 
 // Module of type aliases so we can refer to stylo types with nicer names
@@ -406,6 +407,22 @@ pub(crate) fn style(
         strikethrough_size: Default::default(),
         strikethrough_brush: Default::default(),
     }
+}
+
+/// The styles a form control's own text is shaped with: a text input's editor, its
+/// placeholder or password mask, a `<select>`'s label. Only size, line height and brush
+/// (the control's node id, which paint resolves to its colour).
+pub(crate) fn control_text_styles(node: &Node) -> [parley::StyleProperty<'static, TextBrush>; 3] {
+    let style = node
+        .primary_styles()
+        .as_ref()
+        .map(|s| self::style(node.id, s))
+        .unwrap_or_default();
+    [
+        parley::StyleProperty::FontSize(style.font_size),
+        parley::StyleProperty::LineHeight(style.line_height),
+        parley::StyleProperty::Brush(style.brush),
+    ]
 }
 
 #[cfg(test)]
