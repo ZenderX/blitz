@@ -2,10 +2,12 @@ mod background;
 mod border;
 mod box_shadow;
 mod clip_path;
+mod column_rule;
 mod form_controls;
 mod mask;
+mod resizer;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -20,8 +22,8 @@ use crate::text::DrawTextContext;
 use crate::{CustomWidgetSceneMap, SELECTION_COLOR};
 use anyrender::{PaintScene, Scene};
 use blitz_dom::node::{
-    ListItemLayout, ListItemLayoutPosition, Marker, NodeData, RasterImageData, TextBrush,
-    TextInputData, TextNodeData,
+    LayoutFlow, ListItemLayout, ListItemLayoutPosition, Marker, NodeData, RasterImageData,
+    SpecialElementData, TextBrush, TextInputData, TextNodeData,
 };
 use blitz_dom::{BaseDocument, ElementData, Node, NodeId, local_name};
 use blitz_traits::devtools::DevtoolSettings;
@@ -127,6 +129,12 @@ pub struct BlitzDomPainter<'dom, 'a> {
 
     // Pre-computed `Scene`s for each CustomWidget
     pub(crate) custom_widget_scenes: &'a CustomWidgetSceneMap,
+
+    /// Elements captured in a view transition, which paint only as their snapshot or
+    /// `::view-transition-new()` image (`crate::view_transition`).
+    pub(crate) captured: Vec<NodeId>,
+    /// The captured element being painted as its own image right now.
+    pub(crate) live_capture: Cell<Option<NodeId>>,
 }
 
 impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
@@ -148,6 +156,12 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
 
         let layer_manager = LayerManager::default();
         let root_element_id = dom.try_root_element().map(|el| el.id);
+        // The root's new image is the document itself, so the root still paints.
+        let captured = dom
+            .view_transition_new_elements()
+            .into_iter()
+            .filter(|&id| Some(id) != root_element_id)
+            .collect();
 
         Self {
             dom,
@@ -165,6 +179,8 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
             draw_text_context: RefCell::new(DrawTextContext::default()),
             selection_ranges,
             custom_widget_scenes,
+            captured,
+            live_capture: Cell::new(None),
         }
     }
 
@@ -285,13 +301,16 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
     ///
     /// Approaching rendering this way guarantees we have all the styles we need when rendering text with not having
     /// to traverse back to the parent for its styles, or needing to pass down styles
-    fn render_element(
+    pub(crate) fn render_element(
         &self,
         scene: &mut impl PaintScene,
         node_id: NodeId,
         parent_style_transform: Affine,
         clip_rect: Rect,
     ) {
+        if self.captured.contains(&node_id) && self.live_capture.get() != Some(node_id) {
+            return;
+        }
         let node = &self.dom.as_ref().tree()[node_id];
 
         // Early return if the element is hidden
@@ -461,8 +480,13 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                 // Save it so that the mask can be drawn untransformed by scroll offsets.
                 let unscrolled_transform = cx.transform;
 
-                let filter = convert_filters(&effects.filter.0).map(Arc::new);
-                let backdrop_filter = convert_filters(&effects.backdrop_filter.0).map(Arc::new);
+                let border_box = cx.frame.border_box_path().bounding_box();
+                let filter = convert_filters(&effects.filter.0, self.dom, border_box, self.scale);
+                let filter_region = filter.as_ref().and_then(|f| f.region);
+                let filter = filter.map(|f| Arc::new(f.filter));
+                let backdrop_filter =
+                    convert_filters(&effects.backdrop_filter.0, self.dom, border_box, self.scale)
+                        .map(|f| Arc::new(f.filter));
 
                 // Adjust effect layer clip by filter expansion area
                 //
@@ -477,11 +501,16 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                     .map(|f| f.expansion_rect())
                     .unwrap_or(Rect::ZERO);
 
-                let mut effect_layer_clip = cx.frame.border_box_path().bounding_box();
+                let mut effect_layer_clip = border_box;
                 effect_layer_clip.x0 += filter_expansion_area.x0;
                 effect_layer_clip.y0 += filter_expansion_area.y0;
                 effect_layer_clip.x1 += filter_expansion_area.x1;
                 effect_layer_clip.y1 += filter_expansion_area.y1;
+                // A referenced SVG filter's result is its filter region: a flood fills it,
+                // and nothing outside it shows.
+                if let Some(region) = filter_region {
+                    effect_layer_clip = region;
+                }
 
                 // Opacity/Filter layer if box has opacity or a filter.
                 // Clipped to border-box as it needs to include the background and borders.
@@ -494,10 +523,28 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                     filter,
                     backdrop_filter,
                     |scene| {
+                        // vello sizes a filter layer to what is drawn into it, so the
+                        // region is drawn (transparent, which changes no pixel) for a
+                        // flood to fill all of it.
+                        if let Some(region) = filter_region {
+                            scene.fill(
+                                Fill::NonZero,
+                                cx.transform,
+                                Color::TRANSPARENT,
+                                None,
+                                &region,
+                            );
+                        }
                         cx.draw_background(scene);
                         cx.draw_inset_box_shadow(scene);
+                        // Row backgrounds and collapsed borders are measured from the
+                        // table grid box, which captions move off the box's origin.
+                        let box_transform = cx.transform;
+                        cx.transform = box_transform
+                            * Affine::translate(cx.frame.border_box.origin().to_vec2());
                         cx.draw_table_row_backgrounds(scene);
                         cx.draw_table_borders(scene);
+                        cx.transform = box_transform;
                         cx.draw_border(scene);
                         cx.stroke_devtools(scene);
 
@@ -539,6 +586,7 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                                 cx.draw_text_input_text(scene, content_position);
                                 cx.draw_inline_layout(scene, content_position);
                                 cx.draw_marker(scene, content_position);
+                                cx.draw_column_rules(scene);
                                 cx.draw_children(scene, cx.transform, child_clip_rect);
                             },
                         );
@@ -550,6 +598,10 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                             cx.transform = unscrolled_transform;
                             cx.draw_scrollbars(scene);
                         }
+
+                        // The `resize` grip, unscrolled above the content and scrollbars.
+                        cx.transform = unscrolled_transform;
+                        cx.draw_resizer(scene);
                     },
                 );
 
@@ -605,9 +657,14 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
         // todo: maybe cache this so we don't need to constantly be figuring it out
         // It is quite a bit of math to calculate during render/traverse
         // Also! we can cache the bezpaths themselves, saving us a bunch of work
-        let frame = create_css_rect(&style, &layout, scale);
-
         let element = node.element_data().unwrap();
+
+        // A table with captions decorates its grid box, not the captions around it.
+        let border_box = match &element.special_data {
+            SpecialElementData::TableRoot(table) => *table.grid_box.borrow(),
+            _ => None,
+        };
+        let frame = create_css_rect(&style, &layout, border_box, scale);
 
         ElementCx {
             context: self,
@@ -629,7 +686,9 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
 
 fn to_image_quality(image_rendering: ImageRendering) -> peniko::ImageQuality {
     match image_rendering {
-        ImageRendering::Auto => peniko::ImageQuality::Medium,
+        ImageRendering::Auto | ImageRendering::Smooth => peniko::ImageQuality::Medium,
+        // css-images-3 §5.3: `smooth`, preferring a higher-quality scaler.
+        ImageRendering::HighQuality => peniko::ImageQuality::High,
         ImageRendering::CrispEdges => peniko::ImageQuality::Low,
         ImageRendering::Pixelated => peniko::ImageQuality::Low,
     }
@@ -829,8 +888,36 @@ impl ElementCx<'_, '_> {
                     panic!("Tried to render node marked as inline root that does not have an inline layout: {:?}", self.node);
                 });
 
-            let transform =
+            let mut transform =
                 self.transform * Affine::translate((pos.x * self.scale, pos.y * self.scale));
+
+            let first_line = self.node.first_line_styles();
+
+            let flow = self.element.layout_flow;
+            let layout = self.node.final_layout();
+            let content = Size::new(
+                (layout.size.width
+                    - layout.padding.left
+                    - layout.padding.right
+                    - layout.border.left
+                    - layout.border.right) as f64
+                    * self.scale,
+                (layout.size.height
+                    - layout.padding.top
+                    - layout.padding.bottom
+                    - layout.border.top
+                    - layout.border.bottom) as f64
+                    * self.scale,
+            );
+            if flow == LayoutFlow::CombinedText {
+                transform *=
+                    crate::vertical_text::combined_text_transform(&text_layout.layout, content);
+            }
+            let line_transform = |line: &parley::Line<'_, TextBrush>| {
+                crate::vertical_text::line_transform(flow, content, line)
+                    .map_or(transform, |line_transform| transform * line_transform)
+            };
+            let vertical_flow = flow.is_vertical().then_some(flow);
 
             // Render inline element backgrounds (e.g. `<span style="background: ...">`)
             // behind the text and selection highlight.
@@ -838,8 +925,9 @@ impl ElementCx<'_, '_> {
                 scene,
                 text_layout.layout.lines(),
                 self.context.dom,
-                transform,
+                &line_transform,
                 self.node.id,
+                first_line.as_deref(),
             );
 
             // Render text selection highlight (if any) using cached selection ranges
@@ -847,7 +935,7 @@ impl ElementCx<'_, '_> {
                 crate::text::draw_text_selection(
                     scene,
                     &text_layout.layout,
-                    transform,
+                    &line_transform,
                     sel_start,
                     sel_end,
                 );
@@ -859,10 +947,26 @@ impl ElementCx<'_, '_> {
                 scene,
                 text_layout.layout.lines(),
                 self.context.dom,
-                transform,
+                &line_transform,
                 self.scale,
                 self.node.id,
+                first_line.as_deref(),
                 &mut draw_text_context,
+                vertical_flow,
+            );
+            crate::text_marks::draw_line_hyphens(
+                scene,
+                text_layout,
+                self.context.dom,
+                &line_transform,
+                self.scale,
+            );
+            crate::text_marks::draw_emphasis_marks(
+                scene,
+                text_layout,
+                self.context.dom,
+                &line_transform,
+                self.scale,
             );
         }
     }
@@ -979,10 +1083,12 @@ impl ElementCx<'_, '_> {
                         scene,
                         layout.lines(),
                         dom,
-                        transform,
+                        &|_| transform,
                         self.scale,
                         self.node.id,
+                        None,
                         &mut self.context.draw_text_context.borrow_mut(),
+                        None,
                     );
                 },
             );
@@ -1029,10 +1135,12 @@ impl ElementCx<'_, '_> {
                 scene,
                 layout.lines(),
                 self.context.dom,
-                transform,
+                &|_| transform,
                 self.scale,
                 self.node.id,
+                None,
                 &mut draw_text_context,
+                None,
             );
         }
     }
@@ -1131,7 +1239,7 @@ impl ElementCx<'_, '_> {
             .pre_scale_non_uniform(x_scale, y_scale)
             .then_translate(Vec2 { x, y });
 
-        anyrender_svg::render_svg_tree(scene, svg, transform);
+        crate::svg::draw_svg_tree(scene, svg, transform);
     }
 
     fn draw_image(&self, scene: &mut impl PaintScene) {
@@ -1145,15 +1253,17 @@ impl ElementCx<'_, '_> {
             let object_position = self.style.clone_object_position();
             let image_rendering = self.style.clone_image_rendering();
             let quality = to_image_quality(image_rendering);
+            let image_orientation = self.style.clone_image_orientation();
 
             // Apply object-fit algorithm
             let container_size = taffy::Size {
                 width: width as f32,
                 height: height as f32,
             };
+            let (natural_width, natural_height) = image.displayed_size(image_orientation);
             let object_size = taffy::Size {
-                width: image.width as f32,
-                height: image.height as f32,
+                width: natural_width as f32,
+                height: natural_height as f32,
             };
             let paint_size = compute_object_fit(container_size, Some(object_size), object_fit);
 
@@ -1172,7 +1282,8 @@ impl ElementCx<'_, '_> {
             let transform = self
                 .transform
                 .pre_translate(Vec2 { x, y })
-                .pre_scale_non_uniform(x_scale, y_scale);
+                .pre_scale_non_uniform(x_scale, y_scale)
+                * image.display_transform(image_orientation);
 
             scene.draw_image(to_peniko_image(image, quality).as_ref(), transform);
         }
@@ -1249,13 +1360,21 @@ fn insets_from_taffy_rect(input: taffy::Rect<f64>) -> Insets {
     }
 }
 
-/// Convert Stylo and Taffy types into Kurbo types
-fn create_css_rect(style: &ComputedValues, layout: &Layout, scale: f64) -> CssBox {
+/// Convert Stylo and Taffy types into Kurbo types. `border_box` is the box's origin and
+/// size when they are not the layout's.
+fn create_css_rect(
+    style: &ComputedValues,
+    layout: &Layout,
+    border_box: Option<(taffy::Point<f32>, taffy::Size<f32>)>,
+    scale: f64,
+) -> CssBox {
+    let (origin, size) = border_box.unwrap_or((taffy::Point::ZERO, layout.size));
     // Resolve and rescale
     // We have to scale since document pixels are not same same as rendered pixels
-    let width: f64 = layout.size.width as f64;
-    let height: f64 = layout.size.height as f64;
-    let border_box = Rect::new(0.0, 0.0, width * scale, height * scale);
+    let width: f64 = size.width as f64;
+    let height: f64 = size.height as f64;
+    let (x, y) = (origin.x as f64 * scale, origin.y as f64 * scale);
+    let border_box = Rect::new(x, y, x + width * scale, y + height * scale);
     let border = insets_from_taffy_rect(layout.border.map(|p| p as f64 * scale));
     let padding = insets_from_taffy_rect(layout.padding.map(|p| p as f64 * scale));
     let outline_width = style.get_outline().outline_width.0.to_f64_px() * scale;

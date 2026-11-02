@@ -37,15 +37,22 @@ pub(super) enum BoxModelBox {
     BorderBox,
     PaddingBox,
     ContentBox,
+    /// `mask-clip: no-clip`: the mask painting area is not clipped to a box.
+    NoClip,
 }
 
-// Also covers MaskClip as the type is the same
+// Also covers MaskClip as the type is the same. The SVG geometry boxes are mask-only
+// values; an element with a CSS layout box uses the content box for `fill-box` and the
+// border box for `stroke-box` and `view-box` (css-masking-1, `mask-clip` and `mask-origin`).
 impl From<StyloBackgroundClip> for BoxModelBox {
     fn from(value: StyloBackgroundClip) -> Self {
         match value {
-            StyloBackgroundClip::BorderBox => Self::BorderBox,
+            StyloBackgroundClip::BorderBox
+            | StyloBackgroundClip::StrokeBox
+            | StyloBackgroundClip::ViewBox => Self::BorderBox,
             StyloBackgroundClip::PaddingBox => Self::PaddingBox,
-            StyloBackgroundClip::ContentBox => Self::ContentBox,
+            StyloBackgroundClip::ContentBox | StyloBackgroundClip::FillBox => Self::ContentBox,
+            StyloBackgroundClip::NoClip => Self::NoClip,
 
             // TODO: support BorderArea
             StyloBackgroundClip::BorderArea => Self::BorderBox,
@@ -66,9 +73,11 @@ impl From<StyloBackgroundOrigin> for BoxModelBox {
 impl From<StyloMaskOrigin> for BoxModelBox {
     fn from(value: StyloMaskOrigin) -> Self {
         match value {
-            StyloMaskOrigin::BorderBox => Self::BorderBox,
+            StyloMaskOrigin::BorderBox | StyloMaskOrigin::StrokeBox | StyloMaskOrigin::ViewBox => {
+                Self::BorderBox
+            }
             StyloMaskOrigin::PaddingBox => Self::PaddingBox,
-            StyloMaskOrigin::ContentBox => Self::ContentBox,
+            StyloMaskOrigin::ContentBox | StyloMaskOrigin::FillBox => Self::ContentBox,
         }
     }
 }
@@ -149,7 +158,10 @@ impl ElementCx<'_, '_> {
             if layer_paints_nothing(&layer) {
                 continue;
             }
-            let background_clip_path = self.box_path(layer.clip);
+            let background_clip_path = match self.local_scroll_area(&layer) {
+                Some(area) => self.local_clip_path(area, layer.clip),
+                None => self.box_path(layer.clip),
+            };
 
             self.context.layer_manager.maybe_with_layer(
                 scene,
@@ -172,6 +184,7 @@ impl ElementCx<'_, '_> {
             BoxModelBox::BorderBox => self.frame.border_box_path(),
             BoxModelBox::PaddingBox => self.frame.padding_box_path(),
             BoxModelBox::ContentBox => self.frame.content_box_path(),
+            BoxModelBox::NoClip => self.unclipped_mask_area().to_path(0.1),
         }
     }
 
@@ -181,7 +194,16 @@ impl ElementCx<'_, '_> {
             BoxModelBox::BorderBox => self.frame.border_box,
             BoxModelBox::PaddingBox => self.frame.padding_box,
             BoxModelBox::ContentBox => self.frame.content_box,
+            BoxModelBox::NoClip => self.unclipped_mask_area(),
         }
+    }
+
+    /// Where an unclipped (`mask-clip: no-clip`) mask layer can show anything: the border
+    /// box and everything the element and its descendants paint outside it.
+    pub(super) fn unclipped_mask_area(&self) -> Rect {
+        self.frame
+            .border_box
+            .union(*self.node.scrollable_overflow())
     }
 
     /// Draw a single layer of a CSS image layer list (`background-image` or `mask-image`)
@@ -276,6 +298,76 @@ impl ElementCx<'_, '_> {
         layer.attachment == StyloBackgroundAttachment::Fixed && !self.is_transformed()
     }
 
+    /// The scrollable area a `background-attachment: local` layer is laid out in
+    /// (css-backgrounds-3 §3.5): the padding box grown by the scrollable overflow and
+    /// moved by the scroll offset, so the layer scrolls with the content. `None` unless
+    /// the layer is `local` on a scroll container; elsewhere `local` acts as `scroll`.
+    fn local_scroll_area(&self, layer: &ImageLayerStyles) -> Option<Rect> {
+        if layer.attachment != StyloBackgroundAttachment::Local
+            || !(self.style.clone_overflow_x().is_scrollable()
+                || self.style.clone_overflow_y().is_scrollable())
+        {
+            return None;
+        }
+        let layout = self.node.final_layout();
+        let scroll = self.node.scroll_offset();
+        let padding_box = self.frame.padding_box;
+        Some(Rect::from_origin_size(
+            (
+                padding_box.x0 - scroll.x * self.scale,
+                padding_box.y0 - scroll.y * self.scale,
+            ),
+            (
+                padding_box.width() + layout.scroll_width() as f64 * self.scale,
+                padding_box.height() + layout.scroll_height() as f64 * self.scale,
+            ),
+        ))
+    }
+
+    /// The `css_box` of a `local` layer's scrollable `area`. The area holds no border, so
+    /// `border-box` is its padding box, as the spec allows for scroll containers.
+    fn local_box_rect(&self, area: Rect, css_box: BoxModelBox) -> Rect {
+        match css_box {
+            // `no-clip` is a mask value, and only background layers are `local`.
+            BoxModelBox::BorderBox | BoxModelBox::PaddingBox | BoxModelBox::NoClip => area,
+            BoxModelBox::ContentBox => {
+                let (padding, content) = (self.frame.padding_box, self.frame.content_box);
+                Rect::new(
+                    area.x0 + (content.x0 - padding.x0),
+                    area.y0 + (content.y0 - padding.y0),
+                    area.x1 - (padding.x1 - content.x1),
+                    area.y1 - (padding.y1 - content.y1),
+                )
+            }
+        }
+    }
+
+    /// A `local` layer's clip: the scrollport (the padding box), narrowed to the scrolled
+    /// content box for `content-box`.
+    fn local_clip_path(&self, area: Rect, clip: BoxModelBox) -> BezPath {
+        match clip {
+            BoxModelBox::BorderBox | BoxModelBox::PaddingBox | BoxModelBox::NoClip => {
+                self.frame.padding_box_path()
+            }
+            BoxModelBox::ContentBox => self
+                .local_box_rect(area, clip)
+                .intersect(self.frame.padding_box)
+                .to_path(0.1),
+        }
+    }
+
+    /// The layer's background positioning area and the transform from its coordinate
+    /// space to the scene.
+    fn positioning_area(&self, layer: &ImageLayerStyles) -> (Rect, Affine) {
+        if self.layer_is_fixed(layer) {
+            self.fixed_positioning_area()
+        } else if let Some(area) = self.local_scroll_area(layer) {
+            (self.local_box_rect(area, layer.origin), self.transform)
+        } else {
+            (self.box_rect(layer.origin), self.transform)
+        }
+    }
+
     /// The background positioning area and the transform from its coordinate
     /// space to the scene for a fixed layer: the viewport, unaffected by any
     /// scrolling.
@@ -323,11 +415,7 @@ impl ElementCx<'_, '_> {
             return;
         }
 
-        let (origin_rect, base_transform) = if self.layer_is_fixed(layer) {
-            self.fixed_positioning_area()
-        } else {
-            (self.box_rect(layer.origin), self.transform)
-        };
+        let (origin_rect, base_transform) = self.positioning_area(layer);
 
         let frame_w = (origin_rect.width() / self.scale) as f32;
         let frame_h = (origin_rect.height() / self.scale) as f32;
@@ -378,7 +466,7 @@ impl ElementCx<'_, '_> {
             ))
             * Affine::scale_non_uniform(x_ratio, y_ratio);
 
-        anyrender_svg::render_svg_tree(scene, &svg.tree, transform);
+        crate::svg::draw_svg_tree(scene, &svg.tree, transform);
     }
 
     fn draw_raster_image_layer(&self, scene: &mut impl PaintScene, layer: &ImageLayerStyles) {
@@ -392,11 +480,7 @@ impl ElementCx<'_, '_> {
         let image_rendering = self.style.clone_image_rendering();
         let quality = to_image_quality(image_rendering);
 
-        let (origin_rect, base_transform) = if self.layer_is_fixed(layer) {
-            self.fixed_positioning_area()
-        } else {
-            (self.box_rect(layer.origin), self.transform)
-        };
+        let (origin_rect, base_transform) = self.positioning_area(layer);
 
         let image_width = image_data.width as f64;
         let image_height = image_data.height as f64;
@@ -473,6 +557,12 @@ impl ElementCx<'_, '_> {
         let (origin_rect, base_transform, clip_rect) = if self.layer_is_fixed(layer) {
             let (viewport_rect, transform) = self.fixed_positioning_area();
             (viewport_rect, transform, viewport_rect)
+        } else if let Some(area) = self.local_scroll_area(layer) {
+            (
+                self.local_box_rect(area, layer.origin),
+                self.transform,
+                self.local_box_rect(area, layer.clip),
+            )
         } else {
             (
                 self.box_rect(layer.origin),

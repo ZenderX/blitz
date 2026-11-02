@@ -1,14 +1,15 @@
 use crate::NodeTree;
+use crate::animation_snapshot::AnimationSnapshot;
 use crate::events::{DragMode, handle_dom_event};
 use crate::font_metrics::BlitzFontMetricsProvider;
 use crate::layout::construct::ConstructionTask;
-use crate::layout::damage::ALL_DAMAGE;
+use crate::layout::damage::{ALL_DAMAGE, ONLY_RELAYOUT};
 use crate::mutator::ViewportMut;
 use crate::net::{
     Resource, ResourceHandler, ResourceLoadResponse, StylesheetHandler, StylesheetLoader,
 };
 use crate::node::{ImageData, NodeFlags, RasterImageData, SpecialElementData, Status, TextBrush};
-use crate::scrolling::ScrollAnimationState;
+use crate::scrolling::{ScrollAnimationState, ScrollGesture};
 use crate::selection::TextSelection;
 use crate::stylo_to_cursor_icon::stylo_to_cursor_icon;
 use crate::traversal::TreeTraverser;
@@ -28,6 +29,7 @@ use blitz_traits::shell::{ColorScheme, DummyShellProvider, ShellProvider, Viewpo
 use cursor_icon::CursorIcon;
 use linebender_resource_handle::{Blob, WeakBlob};
 use markup5ever::{LocalName, local_name};
+use parley::fontique::{Collection, SourceKind};
 use parley::{FontContext, PlainEditorDriver};
 use selectors::{Element, matching::QuirksMode};
 use smallvec::SmallVec;
@@ -64,7 +66,8 @@ use style::{
     selector_parser::SnapshotMap,
     shared_lock::{SharedRwLock, StylesheetGuards},
     stylesheets::{
-        AllowImportRules, CustomMediaMap, DocumentStyleSheet, Origin, OriginSet, Stylesheet,
+        AllowImportRules, CustomMediaMap, DocumentStyleSheet, FontPaletteValuesRule, Origin,
+        OriginSet, Stylesheet,
     },
     stylist::Stylist,
 };
@@ -216,6 +219,8 @@ pub struct BaseDocument {
     pub(crate) viewport_scroll: crate::Point<f64>,
     /// CSS media type used to evaluate `@media` rules.
     pub(crate) media_type: MediaType,
+    /// Whether `prefers-reduced-motion` evaluates to `reduce` in `@media` rules.
+    pub(crate) prefers_reduced_motion: bool,
     /// Strategy for Stylo's style traversal during `resolve`.
     pub(crate) style_threading: StyleThreading,
     /// Whether incremental layout is enabled for this document.
@@ -242,6 +247,8 @@ pub struct BaseDocument {
     /// The Stylo engine
     pub(crate) stylist: Stylist,
     pub(crate) animations: DocumentAnimationSet,
+    /// `animations` as the last `resolve_stylist` left them, including those it finished or canceled
+    pub(crate) animation_snapshot: Vec<AnimationSnapshot>,
     /// Stylo shared lock
     pub(crate) guard: SharedRwLock,
     /// Stylo invalidation map. We insert into this map prior to mutating nodes.
@@ -282,6 +289,8 @@ pub struct BaseDocument {
     pub(crate) click_count: u16,
     /// Whether we're currently in a text selection drag (moved 2px+ from mousedown)
     pub(crate) drag_mode: DragMode,
+    /// The `resize` grip drag in progress, if any (driven by the embedder's input)
+    pub(crate) resize_drag: Option<crate::node::resizer::ResizeDrag>,
     /// The scrollbar thumb currently under the pointer, if any
     pub(crate) hovered_scrollbar: Option<crate::node::ScrollbarRef>,
     /// When each scroll container's overlay scrollbars were last shown
@@ -289,6 +298,8 @@ pub struct BaseDocument {
     pub(crate) scrollbar_activity: HashMap<NodeId, Instant>,
     /// Whether and what kind of scroll animation is currently in progress
     pub(crate) scroll_animation: ScrollAnimationState,
+    /// The user scroll gesture in progress, which snaps its scrollers when it ends
+    pub(crate) scroll_gesture: ScrollGesture,
 
     /// Text selection state (for non-input text)
     pub(crate) text_selection: TextSelection,
@@ -333,6 +344,10 @@ pub struct BaseDocument {
     pub(crate) changed_nodes: HashSet<NodeId>,
     /// Set of changed nodes for updating the accessibility tree
     pub(crate) deferred_construction_nodes: Vec<ConstructionTask>,
+    /// Every counter's value as of the last resolve (`layout::counters`)
+    pub(crate) counter_values: crate::layout::counters::CounterValues,
+    /// The shown view transition pseudo-element tree (`view_transition`)
+    pub(crate) view_transition: Option<crate::view_transition::ViewTransitionState>,
 
     /// Nodes that contain custom widgets
     #[cfg(feature = "custom-widget")]
@@ -431,6 +446,7 @@ enum WeakImageData {
         width: u32,
         height: u32,
         data: WeakBlob<u8>,
+        orientation: image::metadata::Orientation,
     },
     #[cfg(feature = "svg")]
     Svg {
@@ -448,6 +464,7 @@ impl WeakImageData {
                 width: data.width,
                 height: data.height,
                 data: data.data.downgrade(),
+                orientation: data.orientation,
             },
             #[cfg(feature = "svg")]
             ImageData::Svg(data) => Self::Svg {
@@ -465,10 +482,12 @@ impl WeakImageData {
                 width,
                 height,
                 data,
+                orientation,
             } => Some(ImageData::Raster(RasterImageData {
                 width: *width,
                 height: *height,
                 data: data.upgrade()?,
+                orientation: *orientation,
             })),
             #[cfg(feature = "svg")]
             Self::Svg {
@@ -486,6 +505,7 @@ impl WeakImageData {
 pub(crate) fn make_device(
     viewport: &Viewport,
     media_type: MediaType,
+    prefers_reduced_motion: bool,
     font_ctx: Arc<Mutex<FontContext>>,
 ) -> Device {
     let width = viewport.window_size.0 as f32 / viewport.scale();
@@ -494,7 +514,7 @@ pub(crate) fn make_device(
     let device_size = euclid::Size2D::new(width, height) * viewport.scale();
     let device_pixel_ratio = euclid::Scale::new(viewport.scale());
 
-    Device::new(
+    let mut device = Device::new(
         media_type,
         selectors::matching::QuirksMode::NoQuirks,
         viewport_size,
@@ -508,7 +528,31 @@ pub(crate) fn make_device(
         },
         PointerCapabilities::default(),
         PointerCapabilities::default(),
-    )
+    );
+    device.set_prefers_reduced_motion(prefers_reduced_motion);
+    device
+}
+
+/// [`BaseDocument::unregister_font`] on one collection.
+fn unregister_font_from(collection: &mut Collection, family_name: &str, data: &[u8]) -> bool {
+    let Some(family_id) = collection.family_id(family_name) else {
+        return false;
+    };
+    let Some(family) = collection.family(family_id) else {
+        return false;
+    };
+    let mut removed = false;
+    for font in family.fonts() {
+        let is_from_data = match &font.source().kind {
+            SourceKind::Memory(blob) => std::ptr::eq(blob.data(), data),
+            _ => false,
+        };
+        if is_from_data {
+            removed |=
+                collection.unregister_font(family_id, font.width(), font.style(), font.weight());
+        }
+    }
+    removed
 }
 
 impl BaseDocument {
@@ -548,12 +592,16 @@ impl BaseDocument {
         style_config::set_pref!("layout.grid.enabled", true);
         style_config::set_pref!("layout.unimplemented", true);
         style_config::set_pref!("layout.columns.enabled", true);
+        style_config::set_pref!("layout.writing-mode.enabled", true);
+        style_config::set_pref!("layout.css.font-palette.enabled", true);
         style_config::set_pref!("layout.css.basic-shape-shape.enabled", true);
+        // css-values-5 `attr()` as a substitution function in every property.
+        style_config::set_pref!("layout.css.attr.enabled", true);
         style_config::set_pref!("layout.threads", -1);
 
         let viewport = config.viewport.unwrap_or_default();
         let media_type = config.media_type.unwrap_or_else(MediaType::screen);
-        let device = make_device(&viewport, media_type.clone(), font_ctx.clone());
+        let device = make_device(&viewport, media_type.clone(), false, font_ctx.clone());
         let stylist = Stylist::new(device, QuirksMode::NoQuirks);
         let snapshots = SnapshotMap::new();
         let nodes = Box::new(NodeTree::new());
@@ -590,10 +638,12 @@ impl BaseDocument {
             root_node_id: NodeId::default(),
             stylist,
             animations: DocumentAnimationSet::default(),
+            animation_snapshot: Vec::new(),
             snapshots,
             nodes_to_id,
             viewport,
             media_type,
+            prefers_reduced_motion: false,
             style_threading: config.style_threading,
             incremental_layout: config.incremental.unwrap_or(true),
             subdocument_depth: config.subdocument_depth,
@@ -632,6 +682,8 @@ impl BaseDocument {
 
             changed_nodes: HashSet::new(),
             deferred_construction_nodes: Vec::new(),
+            counter_values: Default::default(),
+            view_transition: None,
             image_cache: ImageCache::default(),
             pending_images: HashMap::new(),
             pending_style_image_nodes: Vec::new(),
@@ -647,9 +699,11 @@ impl BaseDocument {
             mousedown_position: taffy::Point::ZERO,
             click_count: 0,
             drag_mode: DragMode::None,
+            resize_drag: None,
             hovered_scrollbar: None,
             scrollbar_activity: HashMap::new(),
             scroll_animation: ScrollAnimationState::None,
+            scroll_gesture: ScrollGesture::default(),
             text_selection: TextSelection::default(),
         };
 
@@ -715,6 +769,16 @@ impl BaseDocument {
 
     pub fn guard(&self) -> &SharedRwLock {
         &self.guard
+    }
+
+    /// The effective `@font-palette-values` rules, in cascade order: by origin, then
+    /// by layer, then in source order, so a later rule wins over an earlier one.
+    pub fn font_palette_values(&self) -> impl Iterator<Item = &FontPaletteValuesRule> {
+        // `_rev` runs from the user-agent origin up to the author one.
+        self.stylist
+            .iter_extra_data_origins_rev()
+            .flat_map(|(data, _)| data.font_palette_values.iter())
+            .map(|(rule, _)| &**rule)
     }
 
     pub fn tree(&self) -> &NodeTree {
@@ -1655,9 +1719,12 @@ impl BaseDocument {
                 let node_id = res.node_id.unwrap();
                 self.add_stylesheet_for_node(css, node_id);
             }
-            Resource::Image(_kind, width, height, image_data) => {
+            Resource::Image(_kind, width, height, image_data, orientation) => {
                 // Create the ImageData and cache it
-                let image = ImageData::Raster(RasterImageData::new(width, height, image_data));
+                let image = ImageData::Raster(RasterImageData {
+                    orientation,
+                    ..RasterImageData::new(width, height, image_data)
+                });
 
                 let Some(url) = res.resolved_url.as_ref() else {
                     return;
@@ -1727,6 +1794,27 @@ impl BaseDocument {
         }
     }
 
+    /// Unregister the faces of `family_name` that a [`Resource::Font`] registered
+    /// from `data` (the same buffer, compared by address and length) from the
+    /// document's font context and every per-thread copy, then re-shape text.
+    /// Returns whether any face was removed. fontique removes by attributes, so
+    /// another face of the family with the same width, style and weight goes too.
+    pub fn unregister_font(&mut self, family_name: &str, data: &[u8]) -> bool {
+        let removed = unregister_font_from(
+            &mut self.font_ctx.lock().unwrap().collection,
+            family_name,
+            data,
+        );
+        #[cfg(feature = "parallel-construct")]
+        for font_ctx in self.thread_font_contexts.iter_mut() {
+            unregister_font_from(&mut font_ctx.get_mut().collection, family_name, data);
+        }
+        if removed {
+            self.invalidate_inline_contexts();
+        }
+        removed
+    }
+
     /// Cache a loaded image and apply it to all nodes waiting on it
     /// (`<img>` elements, `background-image` layers and `mask-image` layers).
     fn apply_loaded_image(&mut self, url: &str, image: ImageData) {
@@ -1757,11 +1845,14 @@ impl BaseDocument {
                     node.cache_mut().clear();
                     node.insert_damage(ALL_DAMAGE);
                 }
-                ImageType::Background(idx) | ImageType::Mask(idx) => {
+                ImageType::Background(idx)
+                | ImageType::Mask(idx)
+                | ImageType::ShapeOutside(idx) => {
                     let layer_image = node.element_data_mut().and_then(|el| {
                         let images = match image_type {
                             ImageType::Background(_) => &mut el.background_images,
                             ImageType::Mask(_) => &mut el.mask_images,
+                            ImageType::ShapeOutside(_) => &mut el.shape_outside_images,
                             ImageType::Image => unreachable!(),
                         };
                         images.get_mut(idx)
@@ -1769,6 +1860,10 @@ impl BaseDocument {
                     if let Some(Some(layer_image)) = layer_image {
                         layer_image.status = Status::Ok;
                         layer_image.image = image.clone();
+                    }
+                    // The image is the float's area: the lines beside it flow again.
+                    if let ImageType::ShapeOutside(_) = image_type {
+                        node.insert_damage(ONLY_RELAYOUT);
                     }
                 }
             }
@@ -1892,18 +1987,24 @@ impl BaseDocument {
     }
 
     /// Apply a state change (hover/focus/active/etc affecting the given [`ElementState`]
-    /// bits) to a node, taking a state-only snapshot beforehand if any style rule
-    /// depends on those bits.
+    /// bits) to a node, taking a state-only snapshot beforehand and marking its
+    /// ancestors dirty afterwards if any style rule depends on those bits. With no
+    /// such rule the change needs no restyle at all.
     pub fn snapshot_node_and(
         &mut self,
         node_id: NodeId,
         state: ElementState,
         cb: impl FnOnce(&mut Node),
     ) {
-        if self.style_depends_on_state(state) {
+        let depends = self.style_depends_on_state(state);
+        if depends {
             self.snapshot_node_state_only(node_id);
         }
-        cb(&mut self.nodes[node_id]);
+        let node = &mut self.nodes[node_id];
+        cb(node);
+        if depends {
+            node.mark_ancestors_dirty();
+        }
     }
 
     // Takes (x, y) co-ordinates (relative to the )
@@ -2308,6 +2409,7 @@ impl BaseDocument {
         self.set_stylist_device(make_device(
             &self.viewport,
             self.media_type.clone(),
+            self.prefers_reduced_motion,
             self.font_ctx.clone(),
         ));
         self.scroll_viewport_by(0.0, 0.0); // Clamp scroll offset
@@ -2333,6 +2435,28 @@ impl BaseDocument {
         self.set_stylist_device(make_device(
             &self.viewport,
             self.media_type.clone(),
+            self.prefers_reduced_motion,
+            self.font_ctx.clone(),
+        ));
+    }
+
+    /// Returns whether `prefers-reduced-motion` evaluates to `reduce` in `@media` rules.
+    pub fn prefers_reduced_motion(&self) -> bool {
+        self.prefers_reduced_motion
+    }
+
+    /// Sets whether the user prefers reduced motion, which `prefers-reduced-motion`
+    /// answers in `@media` rules, and rebuilds the stylist device so updated rules
+    /// apply on the next restyle.
+    pub fn set_prefers_reduced_motion(&mut self, prefers_reduced_motion: bool) {
+        if self.prefers_reduced_motion == prefers_reduced_motion {
+            return;
+        }
+        self.prefers_reduced_motion = prefers_reduced_motion;
+        self.set_stylist_device(make_device(
+            &self.viewport,
+            self.media_type.clone(),
+            self.prefers_reduced_motion,
             self.font_ctx.clone(),
         ));
     }
@@ -3556,6 +3680,7 @@ mod hover_invalidation_tests {
 mod font_face_override_tests {
     use super::*;
     use crate::net::{FontFaceOverrides, Resource, ResourceLoadResponse};
+    use blitz_traits::net::Bytes;
 
     /// Regression-pin for the `@font-face` descriptor-honouring fix.
     ///
@@ -3621,6 +3746,57 @@ mod font_face_override_tests {
             resolved_name, ALIAS,
             "registered family should report the CSS-declared name, \
              not the font file's internal `name` table entry",
+        );
+    }
+
+    fn load_font(document: &mut BaseDocument, family: &str, data: Bytes, weight: f32) {
+        document.load_resource(ResourceLoadResponse {
+            request_id: 0,
+            node_id: None,
+            resolved_url: None,
+            result: Ok(Resource::Font(
+                data,
+                FontFaceOverrides {
+                    family_name: Some(String::from(family)),
+                    weight: Some(weight),
+                    style: None,
+                },
+            )),
+        });
+    }
+
+    fn family_weights(document: &BaseDocument, family: &str) -> Vec<f32> {
+        let mut ctx = document.font_ctx.lock().unwrap();
+        let id = ctx.collection.family_id(family).expect("family registered");
+        let info = ctx.collection.family(id).expect("family info");
+        info.fonts().iter().map(|f| f.weight().value()).collect()
+    }
+
+    /// `unregister_font` removes exactly the faces one delivery registered (a
+    /// script `FontFace` deleted from `document.fonts`), identified by its
+    /// buffer, and leaves the family's other faces registered.
+    #[test]
+    fn unregister_font_removes_only_the_faces_of_its_data() {
+        const FAMILY: &str = "Deletable";
+        let mut document = BaseDocument::new(DocumentConfig::default());
+        let light = Bytes::from(crate::BULLET_FONT.to_vec());
+        let bold = Bytes::from(crate::BULLET_FONT.to_vec());
+        load_font(&mut document, FAMILY, light.clone(), 300.0);
+        load_font(&mut document, FAMILY, bold.clone(), 800.0);
+        assert_eq!(family_weights(&document, FAMILY), [300.0, 800.0]);
+
+        let same_bytes_other_buffer = crate::BULLET_FONT;
+        assert!(
+            !document.unregister_font(FAMILY, same_bytes_other_buffer),
+            "equal bytes in another buffer are not the registered face"
+        );
+        assert!(!document.unregister_font("Other", &light), "no such family");
+
+        assert!(document.unregister_font(FAMILY, &light));
+        assert_eq!(family_weights(&document, FAMILY), [800.0]);
+        assert!(
+            !document.unregister_font(FAMILY, &light),
+            "the face is already gone"
         );
     }
 }

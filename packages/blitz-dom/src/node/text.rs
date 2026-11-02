@@ -3,8 +3,14 @@ use blitz_traits::{
     node_id::NodeId,
     shell::ShellProvider,
 };
+use std::collections::HashMap;
+
+use icu_properties::props::{GeneralCategory, GeneralCategoryGroup};
+use icu_properties::{CodePointMapData, CodePointMapDataBorrowed};
 use keyboard_types::{Key, Modifiers};
-use parley::{ContentWidths, FontContext, LayoutContext};
+use parley::{BreakReason, Cluster, ContentWidths, FontContext, LayoutContext, Line};
+use skrifa::MetadataProvider as _;
+use skrifa::instance::{LocationRef, NormalizedCoord, Size};
 
 use crate::util::ACTION_MOD;
 
@@ -26,6 +32,17 @@ pub struct TextLayout {
     pub text: String,
     pub content_widths: Option<ContentWidths>,
     pub layout: parley::layout::Layout<TextBrush>,
+    /// The `text-emphasis-style` mark of each node in the layout that sets one, laid out
+    /// alone in that node's font at half its size (css-text-decor-3 §3.1).
+    pub emphasis_marks: HashMap<NodeId, parley::layout::Layout<TextBrush>>,
+}
+
+/// The hyphen glyph shown where a line breaks at a soft hyphen (css-text-3 §5.4), in the
+/// font and size of the line's last run.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LineHyphen {
+    pub glyph_id: u32,
+    pub advance: f32,
 }
 
 impl TextLayout {
@@ -37,6 +54,57 @@ impl TextLayout {
         *self
             .content_widths
             .get_or_insert_with(|| self.layout.calculate_content_widths())
+    }
+
+    /// The hyphen that ends `line` when it breaks at a soft hyphen (U+00AD). Like Blink's
+    /// `ComputedStyle::HyphenString`, U+2010 HYPHEN where the font maps it, else U+002D.
+    pub fn line_hyphen(&self, line: &Line<'_, TextBrush>) -> Option<LineHyphen> {
+        if line.break_reason() != BreakReason::Regular {
+            return None;
+        }
+        let run = line.runs().last()?;
+        let ends_at_soft_hyphen = run
+            .clusters()
+            .last()
+            .is_some_and(|cluster| self.text.get(cluster.text_range()) == Some("\u{AD}"));
+        if !ends_at_soft_hyphen {
+            return None;
+        }
+        let font = run.font();
+        let font_ref = skrifa::FontRef::from_index(font.data.as_ref(), font.index).ok()?;
+        let charmap = font_ref.charmap();
+        let glyph_id = charmap.map('\u{2010}').or_else(|| charmap.map('-'))?;
+        let coords: Vec<NormalizedCoord> = run
+            .normalized_coords()
+            .iter()
+            .map(|&coord| NormalizedCoord::from_bits(coord))
+            .collect();
+        let advance = font_ref
+            .glyph_metrics(Size::new(run.font_size()), LocationRef::new(&coords))
+            .advance_width(glyph_id)?;
+        Some(LineHyphen {
+            glyph_id: glyph_id.to_u32(),
+            advance,
+        })
+    }
+
+    /// The emphasis mark drawn over `cluster`, if its node sets one and its character takes
+    /// one: every character but separators, controls, format characters and punctuation
+    /// (css-text-decor-3 §3.1).
+    pub fn emphasis_mark(
+        &self,
+        cluster: &Cluster<'_, TextBrush>,
+    ) -> Option<&parley::layout::Layout<TextBrush>> {
+        const GENERAL_CATEGORY: CodePointMapDataBorrowed<'static, GeneralCategory> =
+            CodePointMapData::<GeneralCategory>::new();
+        let mark = self.emphasis_marks.get(&cluster.first_style().brush.id)?;
+        let ch = self.text.get(cluster.text_range())?.chars().next()?;
+        let category = GENERAL_CATEGORY.get(ch);
+        let skipped = GeneralCategoryGroup::Separator
+            .union(GeneralCategoryGroup::Control)
+            .union(GeneralCategoryGroup::Format)
+            .union(GeneralCategoryGroup::Punctuation);
+        (!skipped.contains(category)).then_some(mark)
     }
 }
 

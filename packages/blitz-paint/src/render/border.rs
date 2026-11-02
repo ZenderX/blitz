@@ -83,7 +83,7 @@ fn beveled_edge_color(color: Color, edge: Edge, inset: bool) -> Color {
 ///
 /// A `groove` looks carved into the page: its outer half is shaded like `inset`
 /// and its inner half like `outset`. `ridge` is the reverse (raised).
-fn grooved_edge_colors(color: Color, edge: Edge, ridge: bool) -> (Color, Color) {
+pub(super) fn grooved_edge_colors(color: Color, edge: Edge, ridge: bool) -> (Color, Color) {
     let outer = beveled_edge_color(color, edge, !ridge);
     let inner = beveled_edge_color(color, edge, ridge);
     (outer, inner)
@@ -96,7 +96,7 @@ fn grooved_edge_colors(color: Color, edge: Edge, ridge: bool) -> (Color, Color) 
 /// while thinner borders use longer dashes and gaps (3:2) so they still read as
 /// dashes rather than dots or a solid line. `thickness` and `scale` are in device
 /// pixels; the 3px threshold is applied in CSS pixels.
-fn dashed_ratios(thickness: f64, scale: f64) -> (f64, f64) {
+pub(super) fn dashed_ratios(thickness: f64, scale: f64) -> (f64, f64) {
     if thickness >= 3.0 * scale {
         (2.0, 1.0)
     } else {

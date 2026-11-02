@@ -22,7 +22,7 @@ use style::Atom;
 use style::invalidation::element::restyle_hints::RestyleHint;
 use style::properties::ComputedValues;
 use style::properties::generated::longhands::position::computed_value::T as Position;
-use style::selector_parser::RestyleDamage;
+use style::selector_parser::{PseudoElement, RestyleDamage};
 use style::servo_arc::Arc as ServoArc;
 use style::shared_lock::SharedRwLock;
 use style::stylesheets::UrlExtraData;
@@ -305,12 +305,24 @@ impl Node {
 
     pub fn set_transform(&mut self, scale: f32) -> Option<Affine> {
         let transform = self.primary_styles().and_then(|s| {
-            let size = self.final_layout().size;
+            use style::values::computed::TransformBox;
+            let layout = self.final_layout();
+            // A box with a CSS layout box uses its content box for `fill-box` and its
+            // border box for `stroke-box` and `view-box` (css-transforms-1 `transform-box`).
+            let inset = match s.get_box().clone_transform_box() {
+                TransformBox::ContentBox | TransformBox::FillBox => layout.border + layout.padding,
+                TransformBox::BorderBox | TransformBox::StrokeBox | TransformBox::ViewBox => {
+                    taffy::Rect::zero()
+                }
+            };
             let reference_box = Rect::new(
-                Point2D::new(CSSPixelLength::new(0.0), CSSPixelLength::new(0.0)),
+                Point2D::new(
+                    CSSPixelLength::new(inset.left),
+                    CSSPixelLength::new(inset.top),
+                ),
                 Size2D::new(
-                    CSSPixelLength::new(size.width),
-                    CSSPixelLength::new(size.height),
+                    CSSPixelLength::new(layout.size.width - inset.left - inset.right),
+                    CSSPixelLength::new(layout.size.height - inset.top - inset.bottom),
                 ),
             );
             // Resolve the transform in CSS pixels, then convert it to device-pixel space
@@ -557,19 +569,20 @@ impl Node {
     // Invalidation is driven by element snapshots: the style traversal diffs the
     // snapshotted (pre-change) state against the current state and invalidates
     // only the elements matched by selectors that depend on the changed state
-    // bits. Ancestors are marked dirty so the traversal reaches this node.
+    // bits. Ancestors are marked dirty so the traversal reaches this node,
+    // except by hover/active: `BaseDocument::snapshot_node_and` marks those only
+    // when a rule depends on the state, so a page without such rules pays no
+    // restyle for pointer movement.
     pub fn hover(&mut self) {
         if let Some(data) = self.element_data_mut() {
             data.element_state.insert(ElementState::HOVER);
         }
-        self.mark_ancestors_dirty();
     }
 
     pub fn unhover(&mut self) {
         if let Some(data) = self.element_data_mut() {
             data.element_state.remove(ElementState::HOVER);
         }
-        self.mark_ancestors_dirty();
     }
 
     pub fn is_hovered(&self) -> bool {
@@ -626,14 +639,12 @@ impl Node {
         if let Some(data) = self.element_data_mut() {
             data.element_state.insert(ElementState::ACTIVE);
         }
-        self.mark_ancestors_dirty();
     }
 
     pub fn unactive(&mut self) {
         if let Some(data) = self.element_data_mut() {
             data.element_state.remove(ElementState::ACTIVE);
         }
-        self.mark_ancestors_dirty();
     }
 
     pub fn is_active(&self) -> bool {
@@ -1088,6 +1099,12 @@ impl Node {
     pub fn primary_styles(&self) -> Option<impl Deref<Target = ServoArc<ComputedValues>>> {
         self.stylo_element_data_opt()
             .and_then(|stylo| stylo.primary_styles())
+    }
+
+    /// The style of this element's `::first-line`, when a rule matches it.
+    pub fn first_line_styles(&self) -> Option<ServoArc<ComputedValues>> {
+        let data = self.stylo_element_data_opt()?.get()?;
+        data.styles.pseudos.get(&PseudoElement::FirstLine).cloned()
     }
 
     pub fn text_content(&self) -> String {

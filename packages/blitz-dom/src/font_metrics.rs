@@ -2,6 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::stylo_to_parley;
 use app_units::Au;
+use parley::fontique::{Query, QueryFont, QueryStatus};
 use parley::{FontContext, FontVariation};
 use skrifa::MetadataProvider as _;
 use skrifa::charmap::Charmap;
@@ -11,6 +12,25 @@ use style::{
     font_metrics::FontMetrics,
     values::computed::{CSSPixelLength, font::QueryFontMetricsFlags},
 };
+
+/// The first font of `query` that maps `ch`.
+pub(crate) fn find_font_for(query: &mut Query, ch: char) -> Option<QueryFont> {
+    let mut font = None;
+    query.matches_with(|q_font: &QueryFont| {
+        let Ok(font_ref) = skrifa::FontRef::from_index(q_font.blob.as_ref(), q_font.index) else {
+            return QueryStatus::Continue;
+        };
+
+        let charmap = font_ref.charmap();
+        if charmap.map(ch).is_some() {
+            font = Some(q_font.clone());
+            QueryStatus::Stop
+        } else {
+            QueryStatus::Continue
+        }
+    });
+    font
+}
 
 #[derive(Clone)]
 pub(crate) struct BlitzFontMetricsProvider {
@@ -31,7 +51,7 @@ impl FontMetricsProvider for BlitzFontMetricsProvider {
         font_size: CSSPixelLength,
         _flags: QueryFontMetricsFlags,
     ) -> FontMetrics {
-        use parley::fontique::{Attributes, Query, QueryFont, QueryStatus};
+        use parley::fontique::Attributes;
         use skrifa::instance::{LocationRef, Size};
         use skrifa::metrics::{GlyphMetrics, Metrics};
 
@@ -68,27 +88,6 @@ impl FontMetricsProvider for BlitzFontMetricsProvider {
         //         .chars()
         //         .collect()
         // }
-
-        fn find_font_for(query: &mut Query, ch: char) -> Option<QueryFont> {
-            let mut font = None;
-            query.matches_with(|q_font: &QueryFont| {
-                use skrifa::MetadataProvider;
-
-                let Ok(font_ref) = skrifa::FontRef::from_index(q_font.blob.as_ref(), q_font.index)
-                else {
-                    return QueryStatus::Continue;
-                };
-
-                let charmap = font_ref.charmap();
-                if charmap.map(ch).is_some() {
-                    font = Some(q_font.clone());
-                    QueryStatus::Stop
-                } else {
-                    QueryStatus::Continue
-                }
-            });
-            font
-        }
 
         fn advance_of(
             query: &mut Query,

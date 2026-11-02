@@ -105,12 +105,18 @@ impl Node {
         let prefer_layout_children = match self.display_constructed_as().inside() {
             DisplayInside::None => return false,
             DisplayInside::Contents => false,
-            DisplayInside::Flow | DisplayInside::FlowRoot | DisplayInside::TableCell => {
+            DisplayInside::Flow
+            | DisplayInside::FlowRoot
+            | DisplayInside::TableCell
+            | DisplayInside::RubyBase
+            | DisplayInside::RubyBaseContainer
+            | DisplayInside::RubyText
+            | DisplayInside::RubyTextContainer => {
                 // Prefer layout children for "block" but not "inline" contexts
                 self.element_data()
                     .is_none_or(|el| el.inline_layout_data.is_none())
             }
-            DisplayInside::Flex | DisplayInside::Grid => true,
+            DisplayInside::Flex | DisplayInside::Grid | DisplayInside::Ruby => true,
             DisplayInside::Table => false,
             DisplayInside::TableRowGroup => false,
             DisplayInside::TableColumn => false,

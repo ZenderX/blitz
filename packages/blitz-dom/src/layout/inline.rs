@@ -1,5 +1,8 @@
 use blitz_traits::node_id::NodeId;
-use parley::{AlignmentOptions, IndentOptions};
+use parley::{Alignment, AlignmentOptions, IndentOptions};
+use style::properties::ComputedValues;
+use style::values::computed::TextAlignLast;
+use style::values::specified::TextAlignKeyword;
 use style::values::specified::box_::DisplayOutside;
 use style::values::{computed::CSSPixelLength, generics::text::GenericTextIndent};
 use taffy::{
@@ -10,11 +13,14 @@ use taffy::{
 };
 
 #[cfg(feature = "floats")]
+use super::shape_outside::{PlacedFloat, line_slot};
+#[cfg(feature = "floats")]
 use parley::YieldData;
 #[cfg(feature = "floats")]
 use taffy::{Clear, Float, prelude::TaffyMaxContent};
 
-use super::resolve_calc_value;
+use super::first_line::FirstLineExtent;
+use super::{hyphenation, resolve_calc_value, ruby};
 use crate::BaseDocument;
 
 impl BaseDocument {
@@ -288,9 +294,22 @@ impl BaseDocument {
             ..child_inputs
         };
 
+        let has_first_line = self.nodes[node_id].first_line_styles().is_some();
+        if has_first_line {
+            self.build_first_line(node_id, &mut inline_layout, FirstLineExtent::All);
+        }
+
+        // A ruby container's annotations reach past its box, which only a full layout reports.
+        let ruby_inputs = taffy::tree::LayoutInput {
+            run_mode: RunMode::PerformLayout,
+            axis: RequestedAxis::Both,
+            ..child_inputs
+        };
+        let mut ruby_reaches: Vec<ruby::LineReach> = Vec::new();
+
         // Update inline boxes
         for ibox in inline_layout.layout.inline_boxes_mut() {
-            let style = self.nodes[NodeId::from_u64(ibox.id)].style();
+            let style = self.nodes[NodeId::from_u64(ibox.id)].style_in_parent_frame();
             let margin = style
                 .margin
                 .resolve_or_zero(inputs.parent_size, resolve_calc_value);
@@ -303,6 +322,18 @@ impl BaseDocument {
             if style.position == Position::Absolute || is_floated {
                 ibox.width = 0.0;
                 ibox.height = 0.0;
+            } else if self.nodes[NodeId::from_u64(ibox.id)].is_ruby_container() {
+                // The box reserves its base's part above the baseline, so that the base sits on
+                // the line's baseline; the line box makes room for the rest.
+                let output = self.compute_child_layout(taffy::NodeId::from(ibox.id), ruby_inputs);
+                let extent = ruby::LineExtent::of(&output);
+                ibox.width = (margin.left + margin.right + output.size.width) * scale;
+                ibox.height = (margin.top + extent.baseline).max(0.0) * scale;
+                ruby_reaches.push(ruby::LineReach {
+                    id: ibox.id,
+                    above: (extent.above - extent.baseline - margin.top) * scale,
+                    below: (extent.below + margin.bottom) * scale,
+                });
             } else {
                 let output = self.compute_child_layout(taffy::NodeId::from(ibox.id), child_inputs);
                 ibox.width = (margin.left + margin.right + output.size.width) * scale;
@@ -321,16 +352,13 @@ impl BaseDocument {
             .length
             .resolve(CSSPixelLength::new(known_dimensions.width.unwrap_or(0.0)))
             .px();
-        inline_layout.layout.set_text_indent(
-            resolved_text_indent,
-            // NOTE: hanging and each_line don't current work because parsing them is cfg'd out in Stylo
-            // due to Servo not yet supporting those features. They should start to "just work" in Blitz
-            // once support is enabled in Stylo.
-            IndentOptions {
-                each_line: text_indent.each_line,
-                hanging: text_indent.hanging,
-            },
-        );
+        let indent_options = IndentOptions {
+            each_line: text_indent.each_line,
+            hanging: text_indent.hanging,
+        };
+        inline_layout
+            .layout
+            .set_text_indent(resolved_text_indent, indent_options);
 
         let pbw = container_pb.horizontal_components().sum() * scale;
         let width = known_dimensions
@@ -352,7 +380,8 @@ impl BaseDocument {
                     AvailableSpace::MinContent => {
                         let mut width: f32 = 0.0;
                         for ibox in inline_layout.layout.inline_boxes_mut() {
-                            let style = self.nodes[NodeId::from_u64(ibox.id)].style();
+                            let style =
+                                self.nodes[NodeId::from_u64(ibox.id)].style_in_parent_frame();
 
                             if style.float.is_floated() {
                                 let margin = style
@@ -381,7 +410,8 @@ impl BaseDocument {
                         let mut right_band: f32 = 0.0;
                         let mut width: f32 = 0.0;
                         for ibox in inline_layout.layout.inline_boxes_mut() {
-                            let style = self.nodes[NodeId::from_u64(ibox.id)].style();
+                            let style =
+                                self.nodes[NodeId::from_u64(ibox.id)].style_in_parent_frame();
                             let float = style.float;
 
                             if float.is_floated() {
@@ -480,22 +510,104 @@ impl BaseDocument {
             return LayoutOutput::from_outer_size(clamped_size);
         }
 
+        #[cfg(feature = "floats")]
+        let first_line_max_advance =
+            block_ctx.find_content_slot(0.0, Clear::None, None).width * scale;
         #[cfg(not(feature = "floats"))]
-        {
-            inline_layout.layout.break_all_lines(Some(width));
+        let first_line_max_advance = width;
+        let first_line_indent = if indent_options.hanging {
+            0.0
+        } else {
+            resolved_text_indent
+        };
+        let first_line_cap = if has_first_line {
+            self.split_first_line(
+                node_id,
+                &mut inline_layout,
+                width,
+                first_line_max_advance,
+                first_line_indent,
+            )
+        } else {
+            None
+        };
+        let cap_first_line = |advance: f32| first_line_cap.map_or(advance, |cap| advance.min(cap));
+
+        // Lines broken at a soft hyphen whose hyphen did not fit, with its advance: the
+        // lines are broken again with that much less room on each.
+        let mut hyphen_room: Vec<(usize, f32)> = Vec::new();
+        // The room the lines leave around themselves for ruby annotations, and how many
+        // times they were broken again for it.
+        let mut ruby_room = ruby::LineRoom::default();
+        let mut ruby_passes = 0;
+
+        #[cfg(not(feature = "floats"))]
+        loop {
+            let room = |line: usize| hyphenation::reserved_room(&hyphen_room, line);
+            let mut breaker = inline_layout.layout.break_lines();
+            breaker.state_mut().set_layout_max_advance(width);
+            breaker
+                .state_mut()
+                .set_line_max_advance(cap_first_line(width - room(0)));
+            breaker.state_mut().set_line_y(ruby_room.before(0));
+            let mut line = 0;
+            while let Some(yield_data) = breaker.break_next() {
+                if let parley::YieldData::LineBreak(_) = yield_data {
+                    if line == 0 && first_line_cap.is_some() {
+                        // Align line 1 in its full width, not the cap it was broken at.
+                        breaker.set_prior_line_width(width - room(0));
+                    }
+                    line += 1;
+                    let state = breaker.state_mut();
+                    state.set_line_max_advance(width - room(line));
+                    state.set_line_y(state.line_y() + ruby_room.before(line));
+                }
+            }
+            breaker.finish();
+            match hyphenation::unfitted_hyphen(
+                &inline_layout,
+                resolved_text_indent,
+                indent_options,
+                &hyphen_room,
+            ) {
+                Some(unfitted) => hyphen_room.push(unfitted),
+                None if ruby_reaches.is_empty() || ruby_passes == ruby::ROOM_PASSES => break,
+                None => {
+                    let measured = ruby::LineRoom::measure(&inline_layout.layout, &ruby_reaches);
+                    if measured.is_settled(&ruby_room) {
+                        break;
+                    }
+                    ruby_room = measured;
+                    ruby_passes += 1;
+                }
+            }
         }
 
         // Perform inline layout
         #[cfg(feature = "floats")]
-        {
+        loop {
+            let room = |line: usize| hyphenation::reserved_room(&hyphen_room, line);
+            let mut line = 0;
+            // Placing a float changes the block context, so a layout that placed one is
+            // not broken again.
+            let mut placed_float = false;
+            // The floats this layout placed, with their `shape-outside` areas.
+            let mut floats: Vec<PlacedFloat> = Vec::new();
+            // A float area's edge depends on the line's block range, known once the line
+            // is broken: the previous line's height (CSS px) stands in for it, and a line
+            // whose own height moves its edges is broken again, at most twice.
+            let mut line_height = 0.0;
+            let mut rebreaks = 0;
             let mut breaker = inline_layout.layout.break_lines();
             let initial_slot = block_ctx.find_content_slot(0.0, Clear::None, None);
+            // The x and width (CSS px) the current line is being broken in.
+            let mut line_box = (initial_slot.x, initial_slot.width);
             let mut has_active_floats = initial_slot.segment_id.is_some();
             let state = breaker.state_mut();
             state.set_layout_max_advance(width);
-            state.set_line_max_advance(initial_slot.width * scale);
+            state.set_line_max_advance(cap_first_line(initial_slot.width * scale - room(line)));
             state.set_line_x(initial_slot.x * scale);
-            state.set_line_y((initial_slot.y * scale) as f64);
+            state.set_line_y((initial_slot.y * scale) as f64 + ruby_room.before(0));
 
             // TODO: revert state and retry layout if a line doesn't fit
             //
@@ -506,8 +618,37 @@ impl BaseDocument {
 
             while let Some(yield_data) = breaker.break_next() {
                 match yield_data {
-                    YieldData::LineBreak(_line_break_data) => {
+                    YieldData::LineBreak(line_break_data) => {
+                        let broken_height = line_break_data.line_height / scale;
+                        if rebreaks < 2 && floats.iter().any(|f| f.area.is_some()) {
+                            let top = (line_break_data.line_y_start / scale as f64) as f32;
+                            let fitted = line_slot(&block_ctx, &floats, top, broken_height);
+                            let moved = (fitted.x - line_box.0).abs() > 0.01
+                                || (fitted.width - line_box.1).abs() > 0.01;
+                            if moved && breaker.revert() {
+                                rebreaks += 1;
+                                line_box = (fitted.x, fitted.width);
+                                let advance = fitted.width * scale - room(line);
+                                let state = breaker.state_mut();
+                                state.set_line_max_advance(if line == 0 {
+                                    cap_first_line(advance)
+                                } else {
+                                    advance
+                                });
+                                state.set_line_x(fitted.x * scale);
+                                continue;
+                            }
+                        }
+                        rebreaks = 0;
+                        line_height = broken_height;
+
+                        if line == 0 && first_line_cap.is_some() {
+                            // Align line 1 in its full width, not the cap it was broken at.
+                            breaker.set_prior_line_width(initial_slot.width * scale - room(0));
+                        }
                         let state = breaker.state_mut();
+                        line += 1;
+                        state.set_line_y(state.line_y() + ruby_room.before(line));
 
                         if has_active_floats {
                             // TODO: revert state and retry layout if a line doesn't fit
@@ -515,15 +656,17 @@ impl BaseDocument {
 
                             let min_y = state.line_y() / scale as f64;
                             let next_slot =
-                                block_ctx.find_content_slot(min_y as f32, Clear::None, None);
+                                line_slot(&block_ctx, &floats, min_y as f32, line_height);
                             has_active_floats = next_slot.segment_id.is_some();
+                            line_box = (next_slot.x, next_slot.width);
 
-                            state.set_line_max_advance(next_slot.width * scale);
+                            state.set_line_max_advance(next_slot.width * scale - room(line));
                             state.set_line_x(next_slot.x * scale);
                             state.set_line_y((next_slot.y * scale) as f64);
                         } else {
+                            line_box = (0.0, width / scale);
                             state.set_line_x(0.0);
-                            state.set_line_max_advance(width);
+                            state.set_line_max_advance(width - room(line));
                         }
 
                         continue;
@@ -533,19 +676,20 @@ impl BaseDocument {
                         continue;
                     }
                     YieldData::InlineBoxBreak(box_break_data) => {
+                        placed_float = true;
                         let state = breaker.state_mut();
                         let node_id = NodeId::from_u64(box_break_data.inline_box_id);
                         let node = &mut self.nodes[node_id];
 
                         // We can assume that the box is a float because we only set `break_on_box: true` for floats
-                        let direction = match node.style().float {
+                        let direction = match node.style_in_parent_frame().float {
                             Float::Left => taffy::FloatDirection::Left,
                             Float::Right => taffy::FloatDirection::Right,
                             Float::None => unreachable!(),
                         };
-                        let clear = node.style().clear;
+                        let clear = node.style_in_parent_frame().clear;
                         let margin = node
-                            .style()
+                            .style_in_parent_frame()
                             .margin
                             .resolve_or_zero(inputs.parent_size, resolve_calc_value);
 
@@ -566,12 +710,26 @@ impl BaseDocument {
                             false,
                         );
 
-                        let min_y = state.line_y() / scale as f64; //.max(pos.y as f64);
-                        let next_slot =
-                            block_ctx.find_content_slot(min_y as f32, Clear::None, None);
-                        has_active_floats = next_slot.segment_id.is_some();
+                        floats.push(PlacedFloat {
+                            is_left: matches!(direction, taffy::FloatDirection::Left),
+                            x: pos.x,
+                            y: pos.y,
+                            width: output.size.width + margin_sum.width,
+                            height: output.size.height + margin_sum.height,
+                            area: self.float_area(
+                                node_id,
+                                output.size,
+                                margin,
+                                float_child_inputs.parent_size,
+                            ),
+                        });
 
-                        state.set_line_max_advance(next_slot.width * scale);
+                        let min_y = state.line_y() / scale as f64; //.max(pos.y as f64);
+                        let next_slot = line_slot(&block_ctx, &floats, min_y as f32, line_height);
+                        has_active_floats = next_slot.segment_id.is_some();
+                        line_box = (next_slot.x, next_slot.width);
+
+                        state.set_line_max_advance(next_slot.width * scale - room(line));
                         state.set_line_x(next_slot.x * scale);
                         state.set_line_y((next_slot.y * scale) as f64);
 
@@ -596,37 +754,48 @@ impl BaseDocument {
                 }
             }
             breaker.finish();
+            if placed_float {
+                break;
+            }
+            match hyphenation::unfitted_hyphen(
+                &inline_layout,
+                resolved_text_indent,
+                indent_options,
+                &hyphen_room,
+            ) {
+                Some(unfitted) => hyphen_room.push(unfitted),
+                None if ruby_reaches.is_empty() || ruby_passes == ruby::ROOM_PASSES => break,
+                None => {
+                    let measured = ruby::LineRoom::measure(&inline_layout.layout, &ruby_reaches);
+                    if measured.is_settled(&ruby_room) {
+                        break;
+                    }
+                    ruby_room = measured;
+                    ruby_passes += 1;
+                }
+            }
         }
 
-        let alignment = self.nodes[node_id]
+        let text_alignments = self.nodes[node_id]
             .primary_styles()
-            .map(|s| {
-                use parley::layout::Alignment;
-                use style::values::specified::TextAlignKeyword;
-
-                match s.clone_text_align() {
-                    TextAlignKeyword::Start => Alignment::Start,
-                    TextAlignKeyword::Left => Alignment::Left,
-                    TextAlignKeyword::Right => Alignment::Right,
-                    TextAlignKeyword::Center => Alignment::Center,
-                    TextAlignKeyword::Justify => Alignment::Justify,
-                    TextAlignKeyword::End => Alignment::End,
-                    TextAlignKeyword::MozCenter => Alignment::Center,
-                    TextAlignKeyword::MozLeft => Alignment::Left,
-                    TextAlignKeyword::MozRight => Alignment::Right,
-                }
-            })
-            .unwrap_or(parley::layout::Alignment::Start);
+            .map(|s| text_alignments(&s))
+            .unwrap_or((Alignment::Start, None));
+        let (alignment, last_line_alignment) = match self.ruby_content_alignment(node_id) {
+            Some(ruby) => (ruby, None),
+            None => text_alignments,
+        };
 
         inline_layout.layout.align(
             alignment,
             AlignmentOptions {
                 align_when_overflowing: false,
+                last_line_alignment,
             },
         );
 
+        // Parley's height sums the line heights, without the ruby room left around them.
         #[allow(unused_mut)]
-        let mut height = inline_layout.layout.height();
+        let mut height = inline_layout.layout.height() + ruby_room.total();
 
         // HACK. TODO: fix in Parley.
         //
@@ -686,26 +855,24 @@ impl BaseDocument {
             for item in line.items() {
                 if let parley::layout::PositionedLayoutItem::InlineBox(ibox) = item {
                     let node = &mut self.nodes[NodeId::from_u64(ibox.id)];
-                    let padding = node
-                        .style()
+                    let style = node.style_in_parent_frame();
+                    let padding = style
                         .padding
                         .resolve_or_zero(child_inputs.parent_size, resolve_calc_value);
-                    let border = node
-                        .style()
+                    let border = style
                         .border
                         .resolve_or_zero(child_inputs.parent_size, resolve_calc_value);
-                    let margin = node
-                        .style()
+                    let margin = style
                         .margin
                         .resolve_or_zero(child_inputs.parent_size, resolve_calc_value);
 
                     #[cfg(feature = "floats")]
-                    let is_floated = node.style().float != Float::None;
+                    let is_floated = style.float != Float::None;
                     #[cfg(not(feature = "floats"))]
                     let is_floated = false;
 
-                    if node.style().position == Position::Absolute {
-                        let direction = node.style().direction;
+                    if style.position == Position::Absolute {
+                        let direction = style.direction;
 
                         // The static position of an absolutely positioned box depends on the
                         // display its hypothetical box would have had (the display specified
@@ -752,14 +919,17 @@ impl BaseDocument {
                         // Re-measure the box to get its border-box size (this hits the layout
                         // cache). The size cannot be recovered from `ibox` dimensions as the
                         // space reserved in the line is clamped to be non-negative.
-                        let size = self
-                            .compute_child_layout(taffy::NodeId::from(ibox.id), child_inputs)
-                            .size;
+                        let is_ruby = self.nodes[NodeId::from_u64(ibox.id)].is_ruby_container();
+                        let output = self.compute_child_layout(
+                            taffy::NodeId::from(ibox.id),
+                            if is_ruby { ruby_inputs } else { child_inputs },
+                        );
+                        let size = output.size;
                         let node = &mut self.nodes[NodeId::from_u64(ibox.id)];
 
                         // Resolve relative inset offsets against the containing block
                         // (the content box of the inline container).
-                        let style = node.style();
+                        let style = node.style_in_parent_frame();
                         let container_content_size = final_size - content_box_inset.sum_axes();
                         let inset = taffy::Rect {
                             left: style
@@ -795,10 +965,13 @@ impl BaseDocument {
                         // A negative `margin-top` shrinks the space the box reserves in the
                         // line but does not move the box itself, which stays anchored to the
                         // bottom of the reserved space.
-                        layout.location.y = (ibox.y / scale)
-                            + margin.top.max(0.0)
-                            + container_pb.top
-                            + inset_offset.y;
+                        let top = if is_ruby {
+                            // The reserved space ends at the line's baseline, where the base's sits.
+                            (ibox.y + ibox.height) / scale - ruby::LineExtent::of(&output).baseline
+                        } else {
+                            (ibox.y / scale) + margin.top.max(0.0)
+                        };
+                        layout.location.y = top + container_pb.top + inset_offset.y;
                         layout.padding = padding; //.map(|p| p / scale);
                         layout.border = border; //.map(|p| p / scale);
                     }
@@ -847,6 +1020,40 @@ impl BaseDocument {
                 && measured_size.height == 0.0,
         }
     }
+}
+
+/// The alignment of a block's lines from `text-align`, and of the lines that end its
+/// paragraphs from `text-align-last` (css-text-3 `#text-align-last-property`). `None`
+/// is `text-align-last: auto`, which parley already models: the lines take `text-align`,
+/// except that `justify` start-aligns them. `justify-all` justifies them too.
+fn text_alignments(style: &ComputedValues) -> (Alignment, Option<Alignment>) {
+    let text_align = style.clone_text_align();
+    let alignment = match text_align {
+        TextAlignKeyword::Start => Alignment::Start,
+        TextAlignKeyword::Left => Alignment::Left,
+        TextAlignKeyword::Right => Alignment::Right,
+        TextAlignKeyword::Center => Alignment::Center,
+        TextAlignKeyword::Justify | TextAlignKeyword::JustifyAll => Alignment::Justify,
+        TextAlignKeyword::End => Alignment::End,
+        TextAlignKeyword::MozCenter => Alignment::Center,
+        TextAlignKeyword::MozLeft => Alignment::Left,
+        TextAlignKeyword::MozRight => Alignment::Right,
+    };
+    let last_line_alignment = match style.clone_text_align_last() {
+        TextAlignLast::Auto if text_align == TextAlignKeyword::JustifyAll => {
+            Some(Alignment::Justify)
+        }
+        TextAlignLast::Auto => None,
+        TextAlignLast::Start => Some(Alignment::Start),
+        TextAlignLast::End => Some(Alignment::End),
+        TextAlignLast::Left => Some(Alignment::Left),
+        TextAlignLast::Right => Some(Alignment::Right),
+        TextAlignLast::Center => Some(Alignment::Center),
+        TextAlignLast::Justify => Some(Alignment::Justify),
+        // Never a computed value: it computes to the parent's.
+        TextAlignLast::MatchParent => None,
+    };
+    (alignment, last_line_alignment)
 }
 
 #[inline(always)]

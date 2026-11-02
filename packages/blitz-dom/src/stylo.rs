@@ -7,6 +7,7 @@ use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 
 use crate::StyleThreading;
+use crate::animation_snapshot::AnimationSnapshot;
 use crate::layout::damage::compute_layout_damage;
 use crate::node::Node;
 use crate::node::NodeData;
@@ -58,6 +59,18 @@ use style_dom::ElementState;
 
 use style::values::computed::text::TextAlign as StyloTextAlign;
 
+/// The properties an inline `<svg>` is parsed with from the cascade, written over the
+/// attributes of the same name (`layout::svg_source`): usvg reads only attributes and
+/// the subtree's own `style`, so author CSS would not reach it otherwise.
+pub(crate) const SVG_SOURCE_PROPERTIES: [&str; 6] = [
+    "clip-rule",
+    "color-interpolation-filters",
+    "flood-color",
+    "flood-opacity",
+    "lighting-color",
+    "transform-origin",
+];
+
 impl crate::document::BaseDocument {
     pub fn resolve_stylist(&mut self, now: f64) {
         style::thread_state::enter(ThreadState::LAYOUT);
@@ -80,6 +93,9 @@ impl crate::document::BaseDocument {
             .flush(&guards)
             .process_style(root, Some(&self.snapshots));
 
+        // Finished here, and gone from `sets` once the traversal restyles their nodes
+        let mut ended = Vec::new();
+
         // Mark actively animating nodes as dirty
         let mut sets = self.animations.sets.write();
         for (key, set) in sets.iter_mut() {
@@ -96,6 +112,12 @@ impl crate::document::BaseDocument {
                 .get(node_id)
                 .is_some_and(|node| node.flags.is_in_document());
             if !in_document {
+                ended.extend(
+                    AnimationSnapshot::of_set(key, set, now).map(|mut snapshot| {
+                        snapshot.state = AnimationState::Canceled;
+                        snapshot
+                    }),
+                );
                 set.animations.clear();
                 set.transitions.clear();
                 continue;
@@ -111,6 +133,7 @@ impl crate::document::BaseDocument {
 
                 if animation.state == AnimationState::Running && animation.has_ended(now) {
                     animation.state = AnimationState::Finished;
+                    ended.push(AnimationSnapshot::of_animation(key, animation, now));
                 }
             }
 
@@ -120,6 +143,7 @@ impl crate::document::BaseDocument {
                 }
                 if transition.state == AnimationState::Running && transition.has_ended(now) {
                     transition.state = AnimationState::Finished;
+                    ended.push(AnimationSnapshot::of_transition(key, transition, now));
                 }
             }
         }
@@ -175,6 +199,39 @@ impl crate::document::BaseDocument {
         self.snapshots.clear();
 
         let mut sets = self.animations.sets.write();
+        // stylo keeps animating display:none elements, their pseudos and descendants.
+        for (key, set) in sets.iter_mut() {
+            let is_rendered = self
+                .nodes
+                .get(NodeId::from_u64(key.node.id() as u64))
+                .and_then(|node| node.primary_styles())
+                .is_some_and(|style| !style.get_box().clone_display().is_none());
+            if is_rendered {
+                continue;
+            }
+            // A run that finished in this resolve's tick is already in `ended`.
+            let live = |state: &AnimationState| {
+                !matches!(state, AnimationState::Finished | AnimationState::Canceled)
+            };
+            for animation in set.animations.iter_mut().filter(|a| live(&a.state)) {
+                animation.state = AnimationState::Canceled;
+                set.dirty = true;
+            }
+            for transition in set.transitions.iter_mut().filter(|t| live(&t.state)) {
+                transition.state = AnimationState::Canceled;
+                set.dirty = true;
+            }
+        }
+        // Before canceled entries are cleared. Only the tick above sets `Finished`,
+        // so a node the traversal skipped cannot report one twice.
+        self.animation_snapshot.clear();
+        for (key, set) in sets.iter() {
+            self.animation_snapshot.extend(
+                AnimationSnapshot::of_set(key, set, now)
+                    .filter(|snapshot| snapshot.state != AnimationState::Finished),
+            );
+        }
+        self.animation_snapshot.append(&mut ended);
         for set in sets.values_mut() {
             set.clear_canceled_animations();
             for animation in set.animations.iter_mut() {
@@ -414,8 +471,10 @@ impl selectors::Element for BlitzNode<'_> {
         children.find(|child| child.is_element())
     }
 
+    // Type and attribute selectors match case-insensitively only on HTML elements, so
+    // `feFlood` matches the SVG element of that name and `feflood` does not.
     fn is_html_element_in_html_document(&self) -> bool {
-        true // self.has_namespace(ns!(html))
+        self.has_namespace(&markup5ever::ns!(html))
     }
 
     fn has_local_name(&self, local_name: &LocalName) -> bool {
@@ -1157,6 +1216,40 @@ impl<'a> TElement for BlitzNode<'a> {
                 }
             }
 
+            // https://svgwg.org/svg2-draft/styling.html#PresentationAttributes
+            // The presentation attributes of the properties an inline `<svg>` takes from the
+            // cascade (`layout::svg_source`) must enter the cascade like `color` does. They
+            // parse as presentation attributes do: a unitless length is in user units (px).
+            if elem.name.ns == markup5ever::ns!(svg) && SVG_SOURCE_PROPERTIES.contains(&&**name) {
+                use style::parser::ParserContext;
+                use style::properties::{PropertyId, SourcePropertyDeclaration};
+                use style::stylesheets::{CssRuleType, Origin};
+                use style_traits::ParsingMode;
+
+                let url_extra_data = crate::url::DocumentUrl::default().url_extra_data();
+                let context = ParserContext::new(
+                    Origin::Author,
+                    &url_extra_data,
+                    Some(CssRuleType::Style),
+                    ParsingMode::ALLOW_UNITLESS_LENGTH,
+                    QuirksMode::NoQuirks,
+                    Default::default(),
+                    None,
+                    None,
+                    Default::default(),
+                );
+                let mut declarations = SourcePropertyDeclaration::default();
+                let mut input = cssparser::ParserInput::new(value);
+                let mut parser = style::values::Parser::new(&mut input);
+                if let Ok(id) = PropertyId::parse(name, &context)
+                    && PropertyDeclaration::parse_into(&mut declarations, id, &context, &mut parser)
+                        .is_ok()
+                    && parser.expect_exhausted().is_ok()
+                {
+                    declarations.drain().declarations.for_each(&mut push_style);
+                }
+            }
+
             // The `border` attribute maps to the four border widths as a
             // pixel length, plus the four border styles as `solid` -- width
             // alone would compute back to zero against the default
@@ -1231,6 +1324,34 @@ impl<'a> TElement for BlitzNode<'a> {
             if *name == local_name!("hidden") {
                 use style::values::specified::Display;
                 push_style(PropertyDeclaration::Display(Display::None));
+            }
+        }
+
+        // `start` and `reversed` give an `ol`'s list-item counter its first value
+        // (HTML "Lists" rendering); an author `counter-reset` still overrides them.
+        if *tag == local_name!("ol") {
+            use style::values::CustomIdent;
+            use style::values::generics::counters::CounterPair;
+            use style::values::specified::{CounterReset, Integer};
+            let start = elem
+                .attr(local_name!("start"))
+                .and_then(|start| style::servo::attr::parse_integer(start.chars()).ok());
+            let is_reversed = elem.attr(local_name!("reversed")).is_some();
+            let value = match start {
+                Some(start) if is_reversed => Some(start.saturating_add(1)),
+                Some(start) => Some(start.saturating_sub(1)),
+                // stylo's "no initial value": the reversed count comes from the items.
+                None if is_reversed => Some(i32::MIN),
+                None => None,
+            };
+            if let Some(value) = value {
+                push_style(PropertyDeclaration::CounterReset(CounterReset::new(vec![
+                    CounterPair {
+                        name: CustomIdent(style::Atom::from("list-item")),
+                        value: Integer::new(value),
+                        is_reversed,
+                    },
+                ])));
             }
         }
     }
@@ -1391,10 +1512,10 @@ impl<'dom> DomTraversal<BlitzNode<'dom>> for RecalcStyle<'_> {
             {
                 sync_anonymous_block_styles(el, &new, context.shared);
                 // Inline SVG is rasterised from a tree built with every element's own
-                // computed `color` baked in (for `currentColor`), so a colour change on
-                // the root or any descendant needs a re-parse of the whole tree. The
-                // box tree is unaffected, so this avoids construction damage.
-                if in_svg && old.clone_color() != new.clone_color() {
+                // computed values baked in (`layout::svg_source`), so a change to one of
+                // them on the root or any descendant needs a re-parse of the whole tree.
+                // The box tree is unaffected, so this avoids construction damage.
+                if in_svg && svg_source_changed(&old, &new) {
                     let root = outermost_svg_ancestor(el);
                     let mut queued = self.svg_nodes_to_reparse.lock().unwrap();
                     if !queued.contains(&root) {
@@ -1547,6 +1668,14 @@ fn outermost_svg_ancestor(el: &Node) -> NodeId {
     el.id
 }
 
+#[cfg(feature = "svg")]
+use crate::layout::svg_source::source_changed as svg_source_changed;
+
+#[cfg(not(feature = "svg"))]
+fn svg_source_changed(_old: &ComputedValues, _new: &ComputedValues) -> bool {
+    false
+}
+
 /// Recompute the styles of an element's anonymous blocks from its freshly-computed
 /// primary style.
 ///
@@ -1595,7 +1724,7 @@ fn sync_anonymous_block_styles(
     }
 }
 
-/// Whether a node's `background-image`/`mask-image` layers need flushing to
+/// Whether a node's `background-image`/`mask-image`/`shape-outside` layers need flushing to
 /// dedicated storage on the node: the URLs referenced by the new style differ
 /// from the image data currently stored on the node.
 fn needs_style_image_flush(node: &Node, style: &ComputedValues) -> bool {
@@ -1627,6 +1756,10 @@ fn needs_style_image_flush(node: &Node, style: &ComputedValues) -> bool {
             &style.get_background().background_image.0,
             &el.background_images,
         ) || out_of_sync(&style.get_svg().mask_image.0, &el.mask_images)
+            || out_of_sync(
+                crate::layout::damage::shape_outside_layers(style),
+                &el.shape_outside_images,
+            )
     })
 }
 

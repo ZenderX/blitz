@@ -80,10 +80,12 @@ impl ElementCx<'_, '_> {
                         scene,
                         layout.lines(),
                         dom,
-                        text_transform,
+                        &|_| text_transform,
                         self.scale,
                         self.node.id,
+                        None,
                         &mut self.context.draw_text_context.borrow_mut(),
+                        None,
                     );
                 },
             );

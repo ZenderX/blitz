@@ -77,7 +77,12 @@ impl BaseDocument {
 
         // we need to resolve stylist first since it will need to drive our layout bits
         self.resolve_stylist(current_time_for_animations);
+        self.resolve_view_transition();
         timer.record_time("style");
+
+        // Before damage propagation, which carries the damage of changed counter text
+        self.resolve_counters();
+        timer.record_time("counters");
 
         // Propagate damage flags (from mutation and restyles) up and down the tree
         if self.incremental_layout {
@@ -334,6 +339,7 @@ impl BaseDocument {
                         &mut layout,
                         self.viewport.scale(),
                         task.node_id,
+                        None,
                     );
 
                     #[cfg(feature = "parallel-construct")]
@@ -389,6 +395,7 @@ impl BaseDocument {
         taffy::compute_root_layout(self, root_element_id, available_space);
         self.layout_fixed_boxes();
         taffy::round_layout(self, root_element_id);
+        self.map_vertical_layouts(self.root_element().id);
 
         // println!("\n\n");
         // taffy::print_tree(self, root_node_id)

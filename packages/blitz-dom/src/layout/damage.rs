@@ -1,9 +1,10 @@
 use blitz_traits::node_id::NodeId;
 use std::ops::Range;
 
+use super::writing_mode;
 use crate::Node;
 use crate::net::ResourceHandler;
-use crate::node::NodeFlags;
+use crate::node::{LayoutFlow, NodeFlags};
 use crate::{
     BaseDocument, net::ImageHandler, node::ImageResourceData, node::Status, util::ImageLayerKind,
 };
@@ -12,6 +13,8 @@ use style::properties::generated::longhands::position::computed_value::T as Posi
 use style::selector_parser::RestyleDamage;
 use style::url::ComputedUrl;
 use style::values::computed::Float;
+use style::values::computed::image::Image as ComputedImage;
+use style::values::generics::basic_shape::ShapeOutside;
 use style::values::generics::image::Image as StyloImage;
 use style::values::specified::align::AlignFlags;
 use style::values::specified::box_::DisplayInside;
@@ -196,6 +199,14 @@ impl BaseDocument {
 //     }
 // }
 
+/// The `shape-outside` image as an image layer list of one layer, or of none.
+pub(crate) fn shape_outside_layers(style: &ComputedValues) -> &[ComputedImage] {
+    match &style.get_box().shape_outside {
+        ShapeOutside::Image(image) => std::slice::from_ref(image),
+        ShapeOutside::None | ShapeOutside::Shape(..) | ShapeOutside::Box(_) => &[],
+    }
+}
+
 pub(crate) fn compute_layout_damage(old: &ComputedValues, new: &ComputedValues) -> RestyleDamage {
     let box_tree_needs_rebuild = || {
         let old_box = old.get_box();
@@ -268,7 +279,9 @@ pub(crate) fn compute_layout_damage(old: &ComputedValues, new: &ComputedValues) 
                 || old_text.overflow_wrap != new_text.overflow_wrap
                 || old_text.letter_spacing != new_text.letter_spacing
                 || old_text.word_spacing != new_text.word_spacing
-                || old_text.text_rendering != new_text.text_rendering)
+                || old_text.text_rendering != new_text.text_rendering
+                || old_text.hyphens != new_text.hyphens
+                || old_text.text_emphasis_style != new_text.text_emphasis_style)
         {
             return true;
         }
@@ -419,7 +432,7 @@ impl BaseDocument {
     }
 
     pub fn flush_styles_to_layout(&mut self, node_id: NodeId) {
-        self.flush_styles_to_layout_impl(node_id, None);
+        self.flush_styles_to_layout_impl(node_id, None, LayoutFlow::HorizontalTb);
     }
 
     /// Flush the image layers of nodes whose style changed during the last
@@ -436,11 +449,13 @@ impl BaseDocument {
             }
             self.flush_image_layers_from_style(node_id, ImageLayerKind::Background);
             self.flush_image_layers_from_style(node_id, ImageLayerKind::Mask);
+            self.flush_image_layers_from_style(node_id, ImageLayerKind::ShapeOutside);
         }
     }
 
-    /// Flush a CSS image layer list (`background-image` or `mask-image`) from style
-    /// to dedicated storage on the node, fetching any images which are not yet loaded.
+    /// Flush a CSS image layer list (`background-image`, `mask-image` or the
+    /// `shape-outside` image) from style to dedicated storage on the node, fetching
+    /// any images which are not yet loaded.
     fn flush_image_layers_from_style(&mut self, node_id: NodeId, kind: ImageLayerKind) {
         let doc_id = self.id();
         let node = self.nodes.get_mut(node_id).unwrap();
@@ -461,12 +476,15 @@ impl BaseDocument {
             return;
         };
 
-        let (style_images, elem_images) = match kind {
+        let (style_images, elem_images): (&[ComputedImage], _) = match kind {
             ImageLayerKind::Background => (
                 &style.get_background().background_image.0,
                 &mut elem.background_images,
             ),
             ImageLayerKind::Mask => (&style.get_svg().mask_image.0, &mut elem.mask_images),
+            ImageLayerKind::ShapeOutside => {
+                (shape_outside_layers(&style), &mut elem.shape_outside_images)
+            }
         };
 
         let len = style_images.len();
@@ -532,13 +550,26 @@ impl BaseDocument {
     }
 
     /// Walk the whole tree, converting styles to layout
+    /// `parent_flow` is the writing mode the node's layout parent lays it out in.
     fn flush_styles_to_layout_impl(
         &mut self,
         node_id: NodeId,
         parent_stacking_context: Option<&mut HoistedPaintChildren>,
+        parent_flow: LayoutFlow,
     ) {
         let mut new_stacking_context: HoistedPaintChildren = HoistedPaintChildren::new();
         let stacking_context = &mut new_stacking_context;
+
+        let flow = {
+            let node = &self.nodes[node_id];
+            let parent_style = node
+                .parent
+                .and_then(|parent| self.nodes[parent].primary_styles());
+            node.primary_styles()
+                .map_or(LayoutFlow::HorizontalTb, |style| {
+                    writing_mode::flow_of(&style, parent_style.as_deref().map(|style| &**style))
+                })
+        };
 
         let incremental = self.incremental_layout;
         let display = {
@@ -564,10 +595,17 @@ impl BaseDocument {
                 .data
                 .downcast_element()
                 .is_some_and(|el| crate::layout::replaced::is_replaced_element(&el.name.local));
+            let (taffy_style, parent_frame_style) =
+                writing_mode::styles_for_flow(taffy_style, flow, parent_flow);
 
             // if damage.intersects(RestyleDamage::RELAYOUT | CONSTRUCT_BOX) {
             *node.style_mut() = taffy_style;
             *node.display_constructed_as_mut() = display_constructed_as;
+            if let Some(element) = node.element_data_mut() {
+                element.layout_flow = flow;
+                element.parent_layout_flow = parent_flow;
+                element.parent_frame_style = parent_frame_style;
+            }
             // }
 
             // In non-incremental mode we unconditionally clear the Taffy cache.
@@ -599,6 +637,7 @@ impl BaseDocument {
                         true => None,
                         false => Some(stacking_context),
                     },
+                    flow,
                 );
             }
 

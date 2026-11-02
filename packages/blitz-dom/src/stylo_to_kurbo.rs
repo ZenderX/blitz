@@ -86,14 +86,10 @@ pub fn resolve_2d_transform(
     //   - Translating by the inverse of the origin offset
     let transform_origin = &box_styles.transform_origin;
     let origin_translation = Affine::translate(Vec2 {
-        x: transform_origin
-            .horizontal
-            .resolve(reference_box.width())
+        x: (reference_box.origin.x + transform_origin.horizontal.resolve(reference_box.width()))
             .px() as f64,
-        y: transform_origin
-            .vertical
-            .resolve(reference_box.height())
-            .px() as f64,
+        y: (reference_box.origin.y + transform_origin.vertical.resolve(reference_box.height())).px()
+            as f64,
     });
 
     let mut resolved = Affine::IDENTITY;
