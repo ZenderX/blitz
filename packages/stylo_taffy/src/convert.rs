@@ -50,8 +50,12 @@ pub(crate) mod stylo {
     pub(crate) use style::{
         computed_values::grid_auto_flow::T as GridAutoFlow,
         values::{
+            CustomIdent,
             computed::{GridLine, GridTemplateComponent, ImplicitGridTracks},
-            generics::grid::{RepeatCount, TrackBreadth, TrackListValue, TrackSize},
+            generics::grid::{
+                LineNameList, LineNameListValue, RepeatCount, TrackBreadth, TrackListValue,
+                TrackSize,
+            },
             specified::GenericGridTemplateComponent,
         },
     };
@@ -228,6 +232,7 @@ pub fn display(input: stylo::Display) -> taffy::Display {
         stylo::DisplayOutside::Block => {}
         stylo::DisplayOutside::TableCaption => {}
         stylo::DisplayOutside::InternalTable => {}
+        stylo::DisplayOutside::InternalRuby => {}
     };
 
     display
@@ -577,8 +582,9 @@ pub fn grid_template_tracks(
             })
             .collect(),
 
-        // TODO: Implement subgrid and masonry
+        // A subgrid takes its tracks from its parent grid (`grid_template_*_subgrid`)
         stylo::GenericGridTemplateComponent::Subgrid(_) => Vec::new(),
+        // TODO: Implement masonry
         stylo::GenericGridTemplateComponent::Masonry => Vec::new(),
     }
 }
@@ -598,6 +604,45 @@ pub fn grid_template_line_names(
         stylo::GenericGridTemplateComponent::Subgrid(_) => None,
         stylo::GenericGridTemplateComponent::Masonry => None,
     }
+}
+
+/// The line name sets of a `grid-template-rows`/`-columns` value, one per line: the track
+/// list's, or a subgrid's `<line-name-list>`.
+#[cfg(feature = "grid")]
+fn grid_template_names(input: &stylo::GridTemplateComponent) -> Vec<Vec<Atom>> {
+    match input {
+        stylo::GenericGridTemplateComponent::Subgrid(list) => subgrid_line_names(list),
+        _ => match grid_template_line_names(input) {
+            Some(iter) => iter
+                .map(|line_name_set| line_name_set.cloned().collect::<Vec<_>>())
+                .collect::<Vec<_>>(),
+            None => Vec::new(),
+        },
+    }
+}
+
+/// A subgrid's `<line-name-list>`, one name set per line. `repeat(<integer>, …)` expands that
+/// many times; `repeat(auto-fill, …)` expands once, as the subgrid's span is not known here.
+#[cfg(feature = "grid")]
+fn subgrid_line_names(list: &stylo::LineNameList<i32>) -> Vec<Vec<Atom>> {
+    let names = |set: &[stylo::CustomIdent]| -> Vec<Atom> {
+        set.iter().map(|ident| ident.0.clone()).collect()
+    };
+    list.line_names
+        .iter()
+        .flat_map(|value| match value {
+            stylo::LineNameListValue::LineNames(set) => vec![names(set)],
+            stylo::LineNameListValue::Repeat(repeat) => {
+                let count = match repeat.count {
+                    stylo::RepeatCount::Number(count) => count.max(1) as usize,
+                    stylo::RepeatCount::AutoFill | stylo::RepeatCount::AutoFit => 1,
+                };
+                (0..count)
+                    .flat_map(|_| repeat.line_names.iter().map(|set| names(set)))
+                    .collect()
+            }
+        })
+        .collect()
 }
 
 #[inline]
@@ -833,20 +878,19 @@ pub fn to_taffy_style(style: &stylo::ComputedValues) -> taffy::Style<Atom> {
         #[cfg(feature = "grid")]
         grid_template_columns: self::grid_template_tracks(&pos.grid_template_columns),
         #[cfg(feature = "grid")]
-        grid_template_row_names: match self::grid_template_line_names(&pos.grid_template_rows) {
-            Some(iter) => iter
-                .map(|line_name_set| line_name_set.cloned().collect::<Vec<_>>())
-                .collect::<Vec<_>>(),
-            None => Vec::new(),
-        },
+        grid_template_rows_subgrid: matches!(
+            pos.grid_template_rows,
+            stylo::GenericGridTemplateComponent::Subgrid(_)
+        ),
         #[cfg(feature = "grid")]
-        grid_template_column_names: match self::grid_template_line_names(&pos.grid_template_columns)
-        {
-            Some(iter) => iter
-                .map(|line_name_set| line_name_set.cloned().collect::<Vec<_>>())
-                .collect::<Vec<_>>(),
-            None => Vec::new(),
-        },
+        grid_template_columns_subgrid: matches!(
+            pos.grid_template_columns,
+            stylo::GenericGridTemplateComponent::Subgrid(_)
+        ),
+        #[cfg(feature = "grid")]
+        grid_template_row_names: self::grid_template_names(&pos.grid_template_rows),
+        #[cfg(feature = "grid")]
+        grid_template_column_names: self::grid_template_names(&pos.grid_template_columns),
         #[cfg(feature = "grid")]
         grid_template_areas: self::grid_template_areas(&pos.grid_template_areas),
         #[cfg(feature = "grid")]

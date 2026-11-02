@@ -57,7 +57,14 @@ pub struct FontFaceOverrides {
 
 #[derive(Clone, Debug)]
 pub enum Resource {
-    Image(ImageType, u32, u32, Arc<Vec<u8>>),
+    /// RGBA8 pixels already turned by the EXIF orientation that follows them.
+    Image(
+        ImageType,
+        u32,
+        u32,
+        Arc<Vec<u8>>,
+        image::metadata::Orientation,
+    ),
     #[cfg(feature = "svg")]
     Svg(ImageType, crate::node::SvgImageData),
     Css(DocumentStyleSheet),
@@ -201,15 +208,30 @@ impl ServoStylesheetLoader for StylesheetLoader {
             }));
         }
 
+        let sheet_url = url.url().unwrap().clone();
+        // `ImportRule::to_css` reads the media off the imported sheet, so until
+        // the load lands an empty sheet carries it: a `Pending` import would
+        // re-serialize without its media and lose it on the next re-parse.
+        let placeholder = Stylesheet::from_str(
+            "",
+            UrlExtraData(sheet_url.clone()),
+            Origin::Author,
+            media.clone(),
+            lock.clone(),
+            None, // stylesheet_loader
+            None, // error_reporter
+            QuirksMode::NoQuirks,
+            AllowImportRules::No,
+        );
         let import = ImportRule {
             url,
-            stylesheet: ImportSheet::new_pending(),
+            stylesheet: ImportSheet::new(ServoArc::new(placeholder)),
             supports,
             layer,
             source_location: location,
         };
 
-        let url = import.url.url().unwrap().clone();
+        let url = sheet_url;
         let import = ServoArc::new(lock.wrap(import));
         self.net_provider.fetch(
             self.doc_id,
@@ -539,18 +561,15 @@ impl NetHandler for ResourceHandler<ImageHandler> {
 
 impl ImageHandler {
     fn parse(&self, bytes: Bytes) -> Result<Resource, String> {
-        let image_err = match image::ImageReader::new(Cursor::new(&bytes))
-            .with_guessed_format()
-            .expect("IO errors impossible with Cursor")
-            .decode()
-        {
-            Ok(image) => {
-                let raw_rgba8_data = image.clone().into_rgba8().into_raw();
+        let image_err = match decode_oriented(&bytes) {
+            Ok((image, orientation)) => {
+                let (width, height) = (image.width(), image.height());
                 return Ok(Resource::Image(
                     self.kind,
-                    image.width(),
-                    image.height(),
-                    Arc::new(raw_rgba8_data),
+                    width,
+                    height,
+                    Arc::new(image.into_rgba8().into_raw()),
+                    orientation,
                 ));
             }
             Err(e) => e.to_string(),
@@ -572,6 +591,27 @@ impl ImageHandler {
             bytes.len()
         ))
     }
+}
+
+/// Decode `bytes`, with the pixels turned by their EXIF orientation: css-images-3's
+/// initial `image-orientation: from-image`.
+fn decode_oriented(
+    bytes: &[u8],
+) -> image::ImageResult<(image::DynamicImage, image::metadata::Orientation)> {
+    use image::ImageDecoder;
+
+    let mut decoder = image::ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .expect("IO errors impossible with Cursor")
+        .into_decoder()?;
+    // `ImageReader::decode`'s allocation guard, which `into_decoder` leaves out.
+    let mut limits = image::Limits::default();
+    limits.reserve(decoder.total_bytes())?;
+    decoder.set_limits(limits)?;
+    let orientation = decoder.orientation()?;
+    let mut image = image::DynamicImage::from_decoder(decoder)?;
+    image.apply_orientation(orientation);
+    Ok((image, orientation))
 }
 
 #[cfg(test)]

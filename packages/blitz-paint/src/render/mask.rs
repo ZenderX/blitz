@@ -17,8 +17,9 @@
 use crate::render::background::get_cyclic;
 
 use super::ElementCx;
-use super::background::ImageLayerStyles;
+use super::background::{BoxModelBox, ImageLayerStyles};
 use anyrender::PaintScene;
+use kurbo::{BezPath, Shape};
 use peniko::{BlendMode, Compose, Mix};
 use style::properties::generated::longhands::mask_composite::single_value::computed_value::T as StyloMaskComposite;
 use style::values::generics::image::GenericImage;
@@ -53,17 +54,31 @@ impl ElementCx<'_, '_> {
             return false;
         }
 
-        // Content outside of the mask painting area (at largest the border box) has
-        // a mask alpha of 0, so we can clip the isolation layer to the border box.
+        // Content outside of the mask painting area has a mask alpha of 0, so we can
+        // clip the isolation layer to it.
         scene.push_layer(
             Mix::Normal,
             ALMOST_OPAQUE,
             self.transform,
-            &self.frame.border_box_path(),
+            &self.mask_painting_area(),
             None,
             None,
         );
         true
+    }
+
+    /// The largest mask painting area of the element's mask layers: the border box, or
+    /// with a `mask-clip: no-clip` layer, everything the element paints.
+    fn mask_painting_area(&self) -> BezPath {
+        let svg_styles = self.style.get_svg();
+        let is_unclipped = (0..svg_styles.mask_image.0.len()).any(|idx| {
+            BoxModelBox::from(*get_cyclic(&svg_styles.mask_clip.0, idx)) == BoxModelBox::NoClip
+        });
+        if is_unclipped {
+            self.unclipped_mask_area().to_path(0.1)
+        } else {
+            self.frame.border_box_path()
+        }
     }
 
     /// Apply the CSS mask to the content drawn since the corresponding
@@ -78,7 +93,7 @@ impl ElementCx<'_, '_> {
             BlendMode::new(Mix::Normal, Compose::DestIn),
             1.0,
             self.transform,
-            &self.frame.border_box_path(),
+            &self.mask_painting_area(),
             None,
             None,
         );

@@ -105,7 +105,7 @@ impl Node {
     /// The scrollport (padding box) in (unscaled) CSS px relative to the
     /// node's border-box origin. Taffy has content-box helpers but none for
     /// the padding box.
-    fn scrollport(&self) -> KurboRect {
+    pub(super) fn scrollport(&self) -> KurboRect {
         let layout = self.final_layout();
         KurboRect::new(
             layout.border.left as f64,

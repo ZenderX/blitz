@@ -19,17 +19,30 @@ use taffy::{
 };
 
 pub(crate) mod construct;
+pub(crate) mod counter_style;
+pub(crate) mod counters;
 pub(crate) mod damage;
+pub(crate) mod emphasis;
+pub(crate) mod first_line;
 pub(crate) mod fixed;
+pub(crate) mod font_variants;
+pub(crate) mod hyphenation;
 pub(crate) mod inline;
 pub(crate) mod list;
+pub(crate) mod multicol;
 pub(crate) mod replaced;
+pub(crate) mod ruby;
+#[cfg(feature = "floats")]
+pub(crate) mod shape_outside;
+#[cfg(feature = "svg")]
+pub(crate) mod svg_source;
 pub(crate) mod table;
+pub(crate) mod table_caption;
+pub(crate) mod writing_mode;
 
 use self::replaced::{
     IntrinsicSizes, ReplacedContext, compute_replaced_layout, is_replaced_element,
 };
-use self::table::TableTreeWrapper;
 
 /// The default object size for replaced elements
 /// (https://drafts.csswg.org/css-images/#default-object-size).
@@ -82,7 +95,8 @@ impl BaseDocument {
 }
 
 impl BaseDocument {
-    fn compute_child_layout_internal(
+    /// Lays a box out in its own frame: `inputs` and the output are in its own axes.
+    fn compute_child_layout_in_frame(
         &mut self,
         node_id: NodeId,
         inputs: taffy::tree::LayoutInput,
@@ -106,6 +120,10 @@ impl BaseDocument {
         });
         let font_size = font_styles.map(|s| s.0);
         let resolved_line_height = font_styles.map(|s| s.1);
+        let image_orientation = node
+            .primary_styles()
+            .map(|style| style.clone_image_orientation())
+            .unwrap_or(style::computed_values::image_orientation::T::FromImage);
 
         match &mut node.data {
             NodeData::Text(data) => {
@@ -247,7 +265,8 @@ impl BaseDocument {
                     let (intrinsic_sizes, default_object_size) = match &element_data.special_data {
                         SpecialElementData::Image(image_data) => match &**image_data {
                             ImageData::Raster(image) => {
-                                let (width, height) = (image.width as f32, image.height as f32);
+                                let (width, height) = image.displayed_size(image_orientation);
+                                let (width, height) = (width as f32, height as f32);
                                 (
                                     IntrinsicSizes {
                                         width: Some(width),
@@ -347,12 +366,7 @@ impl BaseDocument {
                         panic!("Node marked as table root but doesn't have TableContext");
                     };
                     let context = Arc::clone(context);
-
-                    let mut table_wrapper = TableTreeWrapper {
-                        doc: self,
-                        ctx: context,
-                    };
-                    let mut output = compute_grid_layout(&mut table_wrapper, node_id, inputs);
+                    let mut output = self.compute_table_layout(node_id, inputs, context);
 
                     // HACK: Cap scrollable overflow at node size to prevent scrolling
                     output.scrollable_overflow_rect.left = 0.0;
@@ -369,6 +383,18 @@ impl BaseDocument {
 
                 if node.flags.is_inline_root() {
                     return self.compute_inline_layout(dom_node_id(node_id), inputs, block_ctx);
+                }
+
+                if node.is_ruby_container() {
+                    return self.compute_ruby_layout(node_id, inputs);
+                }
+
+                if matches!(node.style().display, Display::Block | Display::FlowRoot)
+                    && let Some(columns) = node
+                        .primary_styles()
+                        .and_then(|style| multicol::ColumnSpec::of(&style))
+                {
+                    return self.compute_multicol_layout(node_id, inputs, columns);
                 }
 
                 // The default CSS file will set
@@ -494,7 +520,7 @@ impl taffy::LayoutBlockContainer for BaseDocument {
     }
 
     fn get_block_child_style(&self, child_node_id: NodeId) -> Self::BlockItemStyle<'_> {
-        self.get_core_container_style(child_node_id)
+        self.node_from_id(child_node_id).style_in_parent_frame()
     }
 
     #[inline(always)]
@@ -526,7 +552,7 @@ impl taffy::LayoutFlexboxContainer for BaseDocument {
     }
 
     fn get_flexbox_child_style(&self, child_node_id: NodeId) -> Self::FlexboxItemStyle<'_> {
-        self.get_core_container_style(child_node_id)
+        self.node_from_id(child_node_id).style_in_parent_frame()
     }
 }
 
@@ -546,7 +572,7 @@ impl taffy::LayoutGridContainer for BaseDocument {
     }
 
     fn get_grid_child_style(&self, child_node_id: NodeId) -> Self::GridItemStyle<'_> {
-        self.get_core_container_style(child_node_id)
+        self.node_from_id(child_node_id).style_in_parent_frame()
     }
 
     fn set_detailed_grid_info(

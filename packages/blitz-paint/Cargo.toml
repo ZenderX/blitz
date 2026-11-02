@@ -13,7 +13,7 @@ rust-version.workspace = true
 [features]
 default = ["svg"]
 tracing = ["dep:tracing"]
-svg = ["dep:anyrender_svg", "dep:usvg", "blitz-dom/svg"]
+svg = ["dep:anyrender_svg", "dep:resvg", "dep:usvg", "blitz-dom/svg"]
 custom-widget = ["blitz-dom/custom-widget"]
 font-embolden = []
 apple-font-embolden = []
@@ -43,6 +43,8 @@ color = { workspace = true }
 peniko = { workspace = true }
 kurbo = { workspace = true }
 usvg = { workspace = true, optional = true }
+# Rasterises the SVG trees anyrender_svg cannot draw (filters, masks, clip rules).
+resvg = { workspace = true, optional = true }
 
 # Other dependencies
 smallvec = { workspace = true }

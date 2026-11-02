@@ -1,5 +1,7 @@
 use blitz_traits::node_id::NodeId;
 use core::str;
+use std::borrow::Cow;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use markup5ever::{QualName, local_name, ns};
@@ -7,11 +9,12 @@ use parley::{
     FontContext, InlineBox, InlineBoxKind, LayoutContext, TreeBuilder, WhiteSpaceCollapse,
 };
 use style::{
+    computed_values::hyphens::T as Hyphens,
     computed_values::position::T as PositionProperty,
     data::ElementData as StyloElementData,
     shared_lock::StylesheetGuards,
     values::{
-        computed::{Content, ContentItem, Display, Float, TextTransform},
+        computed::{Display, Float, TextTransform},
         specified::box_::{DisplayInside, DisplayOutside},
     },
 };
@@ -22,7 +25,7 @@ use crate::{
     layout::damage::{CONSTRUCT_BOX, CONSTRUCT_DESCENDENT, CONSTRUCT_FC},
     node::{
         ListItemLayout, ListItemLayoutPosition, Marker, NodeFlags, NodeKind, SpecialElementData,
-        TextBrush, TextInputData, TextLayout,
+        TextBrush, TextInputData, TextLayout, combines_text,
     },
     qual_name, stylo_to_parley,
     traversal::{iter_children, iter_children_and_pseudos},
@@ -30,8 +33,13 @@ use crate::{
 
 use super::{
     damage::ALL_DAMAGE,
+    emphasis,
+    first_line::{FirstLineBuild, FirstLineExtent},
+    font_variants::{self, CapsPlan},
+    hyphenation,
     list::{BULLET_FONT_FAMILY, collect_list_item_children},
     replaced::is_replaced_element,
+    ruby::collect_ruby_children,
     table::build_table_context,
 };
 
@@ -75,7 +83,7 @@ pub(crate) struct LayoutChildren {
 
 impl LayoutChildren {
     /// Append a single layout child.
-    fn push(&mut self, child_id: NodeId, doc: &mut BaseDocument) {
+    pub(crate) fn push(&mut self, child_id: NodeId, doc: &mut BaseDocument) {
         self.maybe_push_anon_block(doc);
         self.children.push(child_id);
     }
@@ -86,7 +94,7 @@ impl LayoutChildren {
         self.children.extend_from_slice(slice);
     }
 
-    fn maybe_push_anon_block(&mut self, doc: &mut BaseDocument) {
+    pub(crate) fn maybe_push_anon_block(&mut self, doc: &mut BaseDocument) {
         fn block_is_only_whitespace(doc: &BaseDocument, node_id: NodeId) -> bool {
             for child_id in doc.nodes[node_id].children.iter().copied() {
                 let child = &doc.nodes[child_id];
@@ -114,7 +122,7 @@ impl LayoutChildren {
         self.anonymous_block_id = None;
     }
 
-    fn push_wrapped(
+    pub(crate) fn push_wrapped(
         &mut self,
         container_node_id: NodeId,
         child_id: NodeId,
@@ -398,7 +406,9 @@ fn classify_flow_children(
                 DisplayOutside::Block
                 | DisplayOutside::TableCaption
                 | DisplayOutside::InternalTable => classification.all_inline = false,
-                DisplayOutside::Inline => {
+                // Ruby-internal boxes outside a ruby container (e.g. the `rt`s of an
+                // `rtc`) sit in the line like inline boxes.
+                DisplayOutside::Inline | DisplayOutside::InternalRuby => {
                     classification.all_block = false;
 
                     // We need the "complex" tree fixing when an inline contains a block
@@ -411,22 +421,15 @@ fn classify_flow_children(
     }
 }
 
-/// (Re)parse an inline `<svg>` element's subtree into its `special_data`, resolving
-/// `currentColor` against the element's computed CSS `color`.
+/// (Re)parse an inline `<svg>` element's subtree into its `special_data`, with the
+/// cascade's values baked into its source (`layout::svg_source`).
 #[cfg(feature = "svg")]
 pub(crate) fn parse_inline_svg(doc: &mut BaseDocument, svg_node_id: NodeId) {
     // Already parsed now, so a queued colour-change re-parse would be redundant
     doc.pending_svg_reparse_nodes
         .retain(|&id| id != svg_node_id);
-    let mut outer_html = doc.get_node(svg_node_id).unwrap().outer_html();
 
-    // HACK: usvg fails to parse SVGs that don't have the SVG xmlns set. So inject it
-    // if the generated source doesn't have it.
-    if !outer_html.contains("xmlns") {
-        outer_html = outer_html.replace("<svg", "<svg xmlns=\"http://www.w3.org/2000/svg\"");
-    }
-
-    match crate::util::parse_svg_image(outer_html.as_bytes()) {
+    match crate::layout::svg_source::parse_inline_svg_source(doc, svg_node_id) {
         Ok(svg) => {
             doc.get_node_mut(svg_node_id)
                 .unwrap()
@@ -439,8 +442,8 @@ pub(crate) fn parse_inline_svg(doc: &mut BaseDocument, svg_node_id: NodeId) {
             #[cfg(feature = "tracing")]
             tracing::warn!(
                 node_id = ?svg_node_id,
-                html = outer_html,
-                error = ?err,
+                source = err.1,
+                error = ?err.0,
                 "SVG parse failed",
             );
             #[cfg(not(feature = "tracing"))]
@@ -513,18 +516,7 @@ fn collect_layout_children_with_wrap(
             return;
         }
 
-        //Only ol tags have start and reversed attributes
-        let (mut index, reversed) = if tag_name == "ol" {
-            (
-                el.attr_parsed(local_name!("start"))
-                    .map(|start: usize| start - 1)
-                    .unwrap_or(0),
-                el.attr_parsed(local_name!("reversed")).unwrap_or(false),
-            )
-        } else {
-            (1, false)
-        };
-        collect_list_item_children(doc, &mut index, reversed, container_node_id);
+        collect_list_item_children(doc, container_node_id);
     }
 
     // Skip further construction if the node has no children or psuedo-children
@@ -584,6 +576,8 @@ fn collect_layout_children_with_wrap(
                 text_item_needs_wrap,
             );
         }
+
+        DisplayInside::Ruby => collect_ruby_children(doc, container_node_id, out),
 
         DisplayInside::Table => {
             let (table_context, tlayout_children) = build_table_context(doc, container_node_id);
@@ -671,24 +665,6 @@ fn collect_layout_children_with_wrap(
     }
 }
 
-/// Extract the text generated by a pseudo-element's `content` property
-/// (only string content items are currently supported).
-fn pe_content_text(style: &style::properties::ComputedValues) -> Option<&str> {
-    match &style.get_counters().content {
-        Content::Items(item_data) => {
-            let items = &item_data.items[0..item_data.alt_start];
-            match items.first() {
-                Some(ContentItem::String(owned_str)) => Some(owned_str),
-                _ => {
-                    // TODO: other types of content
-                    None
-                }
-            }
-        }
-        _ => None,
-    }
-}
-
 fn flush_pseudo_elements(doc: &mut BaseDocument, node_id: NodeId) {
     let (before_style, after_style, before_node_id, after_node_id) = {
         let node = &doc.nodes[node_id];
@@ -735,8 +711,11 @@ fn flush_pseudo_elements(doc: &mut BaseDocument, node_id: NodeId) {
                     .insert(NodeFlags::IS_IN_DOCUMENT);
             }
 
-            if let Some(text) = pe_content_text(pe_style) {
-                let text = text.to_string();
+            if let Some(text) = doc
+                .counter_values
+                .pseudo_text(node_id, idx)
+                .map(str::to_owned)
+            {
                 let text_node_id = doc.create_text_node(&text);
                 doc.nodes[text_node_id].parent = Some(new_node_id);
                 doc.nodes[new_node_id].children.push(text_node_id);
@@ -766,7 +745,10 @@ fn flush_pseudo_elements(doc: &mut BaseDocument, node_id: NodeId) {
             // the style-pointer comparison below, as the pseudo-element's style may
             // already have been updated by `sync_pseudo_element_styles` during the
             // style traversal without the text having been updated.
-            let new_text = pe_content_text(&pe_style).map(str::to_string);
+            let new_text = doc
+                .counter_values
+                .pseudo_text(node_id, idx)
+                .map(str::to_owned);
             let existing_text_node_id = doc.nodes[pe_node_id]
                 .children
                 .first()
@@ -951,6 +933,7 @@ pub(crate) fn find_inline_layout_embedded_boxes(
         node_id: NodeId,
         layout_children: &mut ThinVec<NodeId>,
     ) {
+        let is_text_combined = is_text_combined(nodes, node_id);
         let node = &mut nodes[node_id];
 
         // Set layout_parent for node.
@@ -989,6 +972,7 @@ pub(crate) fn find_inline_layout_embedded_boxes(
                             || *tag_name == local_name!("input")
                             || *tag_name == local_name!("textarea")
                             || *tag_name == local_name!("button")
+                            || is_text_combined
                         {
                             layout_children.push(node_id);
                         } else if *tag_name == local_name!("br") {
@@ -1019,6 +1003,21 @@ pub(crate) fn find_inline_layout_embedded_boxes(
     }
 }
 
+/// Whether `node_id` sets its text as one `text-combine-upright` cell, an atomic inline
+/// box of its line.
+fn is_text_combined(nodes: &crate::NodeTree, node_id: NodeId) -> bool {
+    let node = &nodes[node_id];
+    let Some(style) = node.primary_styles() else {
+        return false;
+    };
+    let parent_style = node
+        .parent
+        .and_then(|parent| nodes[parent].primary_styles());
+    combines_text(&style, parent_style.as_deref().map(|style| &**style))
+}
+
+/// `first_line` restyles that much of the text with the root's `::first-line` style, if
+/// it has one.
 pub(crate) fn build_inline_layout_into(
     nodes: &crate::NodeTree,
     layout_ctx: &mut LayoutContext<TextBrush>,
@@ -1026,6 +1025,7 @@ pub(crate) fn build_inline_layout_into(
     text_layout: &mut TextLayout,
     scale: f32,
     inline_context_root_node_id: NodeId,
+    first_line: Option<FirstLineExtent>,
 ) {
     // Get the inline context's root node's text styles
     let root_node = &nodes[inline_context_root_node_id];
@@ -1040,7 +1040,21 @@ pub(crate) fn build_inline_layout_into(
         .map(|s| stylo_to_parley::style(inline_context_root_node_id, s))
         .unwrap_or_default();
 
+    let mut first_line = first_line.and_then(|extent| {
+        let root_style = root_node_style.as_ref()?;
+        let first_line_style = root_node.first_line_styles()?;
+        Some(FirstLineBuild::new(
+            inline_context_root_node_id,
+            root_style,
+            &first_line_style,
+            extent,
+        ))
+    });
+
     let root_line_height = resolve_line_height(parley_style.line_height, parley_style.font_size);
+
+    // Read before the builder borrows the font context for the whole build.
+    let caps_plans = font_variants::plan_caps(nodes, font_ctx, inline_context_root_node_id);
 
     // Create a parley tree builder
     let mut builder = layout_ctx.tree_builder(font_ctx, scale, true, &parley_style);
@@ -1075,12 +1089,25 @@ pub(crate) fn build_inline_layout_into(
                 let mut marker_style = parley_style.clone();
                 marker_style.font_family = BULLET_FONT_FAMILY.into();
                 builder.push_style_span(marker_style);
-                builder.push_text(&format!("{char} "));
+                let text = format!("{char} ");
+                if let Some(first_line) = &mut first_line {
+                    first_line.skip(&text);
+                }
+                builder.push_text(&text);
                 builder.pop_style_span();
             }
-            Marker::String(str) => builder.push_text(str),
+            Marker::String(str) => {
+                if let Some(first_line) = &mut first_line {
+                    first_line.skip(str);
+                }
+                builder.push_text(str)
+            }
         }
     };
+
+    if let Some(first_line) = &mut first_line {
+        first_line.enter(&mut builder, &parley_style);
+    }
 
     if let Some(before_id) = root_node.before() {
         build_inline_layout_recursive(
@@ -1091,6 +1118,8 @@ pub(crate) fn build_inline_layout_into(
             collapse_mode,
             text_transform,
             root_line_height,
+            &caps_plans,
+            &mut first_line,
         );
     }
     for child_id in root_node.flat_children().iter().copied() {
@@ -1102,6 +1131,8 @@ pub(crate) fn build_inline_layout_into(
             collapse_mode,
             text_transform,
             root_line_height,
+            &caps_plans,
+            &mut first_line,
         );
     }
     if let Some(after_id) = root_node.after() {
@@ -1113,12 +1144,21 @@ pub(crate) fn build_inline_layout_into(
             collapse_mode,
             text_transform,
             root_line_height,
+            &caps_plans,
+            &mut first_line,
         );
     }
 
+    if let Some(first_line) = &mut first_line {
+        first_line.leave(&mut builder);
+    }
+
     text_layout.text = builder.build_into(&mut text_layout.layout);
+    emphasis::build_emphasis_marks(nodes, layout_ctx, font_ctx, text_layout, scale);
     return;
 
+    // The recursion threads the build's state down as plain arguments.
+    #[allow(clippy::too_many_arguments)]
     fn build_inline_layout_recursive(
         builder: &mut TreeBuilder<TextBrush>,
         nodes: &crate::NodeTree,
@@ -1127,6 +1167,8 @@ pub(crate) fn build_inline_layout_into(
         collapse_mode: WhiteSpaceCollapse,
         parent_text_transform: TextTransform,
         root_line_height: f32,
+        caps_plans: &HashMap<NodeId, CapsPlan>,
+        first_line: &mut Option<FirstLineBuild>,
     ) {
         let node = &nodes[node_id];
 
@@ -1184,6 +1226,8 @@ pub(crate) fn build_inline_layout_into(
                                 collapse_mode,
                                 text_transform,
                                 root_line_height,
+                                caps_plans,
+                                first_line,
                             );
                         }
                     }
@@ -1194,6 +1238,7 @@ pub(crate) fn build_inline_layout_into(
                             || *tag_name == local_name!("input")
                             || *tag_name == local_name!("textarea")
                             || *tag_name == local_name!("button")
+                            || is_text_combined(nodes, node_id)
                         {
                             builder.push_inline_box(InlineBox {
                                 id: node_id.as_u64(),
@@ -1221,6 +1266,8 @@ pub(crate) fn build_inline_layout_into(
 
                             // dbg!(&style);
 
+                            // The element's own values, before the line-height floor.
+                            let first_line_own = first_line.is_some().then(|| style.clone());
                             let font_size = style.font_size;
 
                             // Floor the line-height of the span by the line-height of the inline context
@@ -1234,6 +1281,11 @@ pub(crate) fn build_inline_layout_into(
                             // dbg!(&style);
 
                             builder.push_style_span(style);
+                            if let (Some(first_line), Some(own)) =
+                                (first_line.as_mut(), &first_line_own)
+                            {
+                                first_line.enter(builder, own);
+                            }
 
                             if let Some(before_id) = node.before() {
                                 build_inline_layout_recursive(
@@ -1244,6 +1296,8 @@ pub(crate) fn build_inline_layout_into(
                                     collapse_mode,
                                     text_transform,
                                     root_line_height,
+                                    caps_plans,
+                                    first_line,
                                 );
                             }
 
@@ -1256,6 +1310,8 @@ pub(crate) fn build_inline_layout_into(
                                     collapse_mode,
                                     text_transform,
                                     root_line_height,
+                                    caps_plans,
+                                    first_line,
                                 );
                             }
                             if let Some(after_id) = node.after() {
@@ -1267,9 +1323,14 @@ pub(crate) fn build_inline_layout_into(
                                     collapse_mode,
                                     text_transform,
                                     root_line_height,
+                                    caps_plans,
+                                    first_line,
                                 );
                             }
 
+                            if let Some(first_line) = first_line.as_mut() {
+                                first_line.leave(builder);
+                            }
                             builder.pop_style_span();
                         }
                     }
@@ -1292,16 +1353,36 @@ pub(crate) fn build_inline_layout_into(
                 // dbg!(&data.content);
 
                 // TODO: optimize case transforms to be non-allocating
-                match parent_text_transform {
-                    TextTransform::UPPERCASE => {
-                        builder.push_text(&data.content.to_uppercase());
+                let content = match parent_text_transform {
+                    TextTransform::UPPERCASE => Cow::Owned(data.content.to_uppercase()),
+                    TextTransform::LOWERCASE => Cow::Owned(data.content.to_lowercase()),
+                    _ => Cow::Borrowed(data.content.as_str()),
+                };
+                match node.parent.and_then(|id| nodes[id].primary_styles()) {
+                    Some(styles) => {
+                        let hyphens = styles.get_inherited_text().hyphens;
+                        let lang = (hyphens == Hyphens::Auto)
+                            .then(|| hyphenation::content_language(nodes, node_id))
+                            .flatten();
+                        let text = hyphenation::apply(&content, hyphens, lang);
+                        let font = styles.get_font();
+                        let caps = caps_plans.get(&node_id).copied();
+                        let push = |builder: &mut TreeBuilder<'_, TextBrush>, text: &str| {
+                            font_variants::push_text(builder, text, font, caps)
+                        };
+                        match first_line {
+                            Some(first_line) => first_line.push_text(builder, &text, push),
+                            None => push(builder, &text),
+                        }
                     }
-                    TextTransform::LOWERCASE => {
-                        builder.push_text(&data.content.to_lowercase());
-                    }
-                    _ => {
-                        builder.push_text(&data.content);
-                    }
+                    None => match first_line {
+                        Some(first_line) => {
+                            first_line.push_text(builder, &content, |builder, text| {
+                                builder.push_text(text)
+                            })
+                        }
+                        None => builder.push_text(&content),
+                    },
                 }
             }
             NodeData::Comment { .. } => {

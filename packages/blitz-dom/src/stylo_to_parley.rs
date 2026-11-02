@@ -163,11 +163,24 @@ pub(crate) fn font_variant_ligatures(
     }
 }
 
-/// Map the `font-variant-caps` property to OpenType features.
+/// Map the `font-variant-caps` property to OpenType features
+/// (<https://drafts.csswg.org/css-fonts/#font-variant-caps-prop>).
 pub(crate) fn font_variant_caps(input: stylo::FontVariantCaps, out: &mut Vec<parley::FontFeature>) {
+    use stylo::FontVariantCaps as C;
     match input {
-        stylo::FontVariantCaps::Normal => {}
-        stylo::FontVariantCaps::SmallCaps => out.push(feature(b"smcp", 1)),
+        C::Normal => {}
+        C::SmallCaps => out.push(feature(b"smcp", 1)),
+        C::AllSmallCaps => {
+            out.push(feature(b"c2sc", 1));
+            out.push(feature(b"smcp", 1));
+        }
+        C::PetiteCaps => out.push(feature(b"pcap", 1)),
+        C::AllPetiteCaps => {
+            out.push(feature(b"c2pc", 1));
+            out.push(feature(b"pcap", 1));
+        }
+        C::Unicase => out.push(feature(b"unic", 1)),
+        C::TitlingCaps => out.push(feature(b"titl", 1)),
     }
 }
 
@@ -263,10 +276,19 @@ pub(crate) fn font_variant_east_asian(
 /// duplicate tags, so appending `font-feature-settings` after the `font-variant-*`
 /// features gives it the higher precedence required by the spec.
 pub(crate) fn font_features(font_styles: &stylo::Font) -> Vec<parley::FontFeature> {
+    font_features_with_caps(font_styles, font_styles.font_variant_caps)
+}
+
+/// [`font_features`] with `caps` standing in for the style's `font-variant-caps`, for
+/// text whose caps the primary font does not support as requested.
+pub(crate) fn font_features_with_caps(
+    font_styles: &stylo::Font,
+    caps: stylo::FontVariantCaps,
+) -> Vec<parley::FontFeature> {
     let mut features = Vec::new();
 
     self::font_variant_ligatures(font_styles.font_variant_ligatures, &mut features);
-    self::font_variant_caps(font_styles.font_variant_caps, &mut features);
+    self::font_variant_caps(caps, &mut features);
     self::font_variant_numeric(font_styles.font_variant_numeric, &mut features);
     self::font_variant_east_asian(font_styles.font_variant_east_asian, &mut features);
     self::font_variant_position(font_styles.font_variant_position, &mut features);
@@ -495,6 +517,23 @@ mod tests {
         let mut out = Vec::new();
         font_variant_caps(stylo::FontVariantCaps::Normal, &mut out);
         assert!(out.is_empty());
+    }
+
+    /// css-fonts-4 §6.8: each `font-variant-caps` keyword enables its OpenType features.
+    #[test]
+    fn caps_keywords_map_to_their_features() {
+        use stylo::FontVariantCaps as C;
+        for (caps, expected) in [
+            (C::AllSmallCaps, vec![(*b"c2sc", 1), (*b"smcp", 1)]),
+            (C::PetiteCaps, vec![(*b"pcap", 1)]),
+            (C::AllPetiteCaps, vec![(*b"c2pc", 1), (*b"pcap", 1)]),
+            (C::Unicase, vec![(*b"unic", 1)]),
+            (C::TitlingCaps, vec![(*b"titl", 1)]),
+        ] {
+            let mut out = Vec::new();
+            font_variant_caps(caps, &mut out);
+            assert_eq!(pairs(&out), expected, "{caps:?}");
+        }
     }
 
     #[test]

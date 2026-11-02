@@ -6,18 +6,26 @@
 mod color;
 mod debug_overlay;
 mod filters;
+mod font_palette;
 mod gradient;
 mod kurbo_css;
 mod layers;
 mod render;
 mod sizing;
+#[cfg(feature = "svg")]
+mod svg;
 mod text;
+mod text_marks;
+mod vertical_text;
+mod view_transition;
 
 use std::collections::HashMap;
 
 use anyrender::{PaintScene, Scene};
 use blitz_dom::{BaseDocument, NodeId, util::Color};
 use render::BlitzDomPainter;
+
+pub use font_palette::{FontPalette, font_palette};
 
 const FONT_EMBOLDEN_ENABLED: bool = cfg!(any(
     feature = "font-embolden",
@@ -67,7 +75,7 @@ pub fn paint_scene(
         y_offset as f64,
         &custom_widget_scenes,
     );
-    generator.paint_scene(scene);
+    generator.paint_scene_with_view_transition(scene);
 
     // println!(
     //     "Rendered using {} clips (depth: {}) (wanted: {})",
@@ -75,6 +83,34 @@ pub fn paint_scene(
     //     CLIP_DEPTH_USED.load(atomic::Ordering::SeqCst),
     //     CLIPS_WANTED.load(atomic::Ordering::SeqCst)
     // );
+}
+
+/// Paint the old snapshot of `element` for a view transition (css-view-transitions-1
+/// §7.3.1 "capture the image") into `scene`, for the embedder to rasterize into the
+/// image it passes to [`BaseDocument::set_view_transition_content`].
+///
+/// The root element's snapshot is the document in the `width` x `height` viewport.
+/// Any other element's has its border box at the origin, at `scale`. The elements in
+/// `captured` (the transition's other named elements) are left out, as each has a
+/// snapshot of its own.
+pub fn paint_view_transition_snapshot(
+    scene: &mut impl PaintScene,
+    doc: &mut BaseDocument,
+    element: NodeId,
+    captured: &[NodeId],
+    scale: f64,
+    width: u32,
+    height: u32,
+) {
+    #[allow(unused_mut)]
+    let mut custom_widget_scenes: CustomWidgetSceneMap = HashMap::new();
+    #[cfg(feature = "custom-widget")]
+    build_custom_widget_scenes(&mut custom_widget_scenes, doc, scene, scale);
+
+    let mut painter =
+        BlitzDomPainter::new(doc, scale, width, height, 0.0, 0.0, &custom_widget_scenes);
+    painter.captured = captured.to_vec();
+    painter.paint_view_transition_snapshot(scene, element);
 }
 
 #[cfg(feature = "custom-widget")]

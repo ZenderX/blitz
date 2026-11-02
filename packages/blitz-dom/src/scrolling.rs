@@ -9,6 +9,12 @@ use web_time::{SystemTime, UNIX_EPOCH};
 use crate::BaseDocument;
 use crate::util::Point;
 
+mod snap;
+
+pub(crate) use snap::ScrollGesture;
+pub use snap::ScrollSides;
+use snap::SnapStrategy;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ScrollBehavior {
     #[default]
@@ -165,6 +171,22 @@ impl BaseDocument {
         let end = Point {
             x: unclamped.x.clamp(0.0, max.x),
             y: unclamped.y.clamp(0.0, max.y),
+        };
+        // A programmatic scroll snaps at once; a user scroll snaps when its gesture ends.
+        let end = match request.source {
+            ScrollSource::Programmatic => {
+                let strategy = match request.amount {
+                    ScrollAmount::To(_) => SnapStrategy::Absolute,
+                    ScrollAmount::By(_) => SnapStrategy::Directional { from: current },
+                };
+                self.snap_scroll_offset(target, end, max, strategy)
+            }
+            ScrollSource::User => {
+                if end != current {
+                    self.note_user_scroll(target, current);
+                }
+                end
+            }
         };
 
         if self.should_scroll_smoothly(target, request.behavior) {

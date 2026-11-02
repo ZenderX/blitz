@@ -32,6 +32,12 @@ pub struct TableContext {
     pub computed_grid_info: AtomicRefCell<Option<DetailedGridInfo<Atom>>>,
     pub border_style: Option<ServoArc<Border>>,
     pub border_collapse: BorderCollapse,
+    /// The table's `display: table-caption` children, in tree order.
+    pub captions: Vec<NodeId>,
+    /// With captions, the table element's box stands for the table wrapper box and this
+    /// is the table grid box within it, as the offset of its border box from the
+    /// element's and its size.
+    pub grid_box: AtomicRefCell<Option<(taffy::Point<f32>, taffy::Size<f32>)>>,
 }
 
 // #[derive(Debug, Clone, Eq, PartialEq)]
@@ -43,7 +49,7 @@ pub struct TableContext {
 #[derive(Debug, Clone)]
 pub struct TableCell {
     // kind: TableItemKind,
-    node_id: NodeId,
+    pub(crate) node_id: NodeId,
     style: taffy::Style<Atom>,
 }
 
@@ -94,7 +100,16 @@ pub(crate) fn build_table_context(
 
     let mut column_sizes: Vec<taffy::TrackSizingFunction> = Vec::new();
     let mut first_cell_border: Option<ServoArc<Border>> = None;
+    let mut captions: Vec<NodeId> = Vec::new();
     for child_id in children.iter().copied() {
+        let is_caption = doc.nodes[child_id].is_element()
+            && doc.nodes[child_id]
+                .primary_styles()
+                .is_some_and(|s| s.clone_display().outside() == DisplayOutside::TableCaption);
+        if is_caption {
+            captions.push(child_id);
+            continue;
+        }
         collect_table_cells(
             doc,
             child_id,
@@ -161,7 +176,11 @@ pub(crate) fn build_table_context(
         };
     }
 
-    let layout_children = cells.iter().map(|cell| cell.node_id).collect();
+    let layout_children = cells
+        .iter()
+        .map(|cell| cell.node_id)
+        .chain(captions.iter().copied())
+        .collect();
 
     (
         TableContext {
@@ -171,6 +190,8 @@ pub(crate) fn build_table_context(
             computed_grid_info: AtomicRefCell::new(None),
             border_collapse,
             border_style: first_cell_border,
+            captions,
+            grid_box: AtomicRefCell::new(None),
         },
         layout_children,
     )
@@ -332,7 +353,12 @@ pub(crate) fn collect_table_cells(
         DisplayInside::Flow
         | DisplayInside::FlowRoot
         | DisplayInside::Flex
-        | DisplayInside::Grid => {
+        | DisplayInside::Grid
+        | DisplayInside::Ruby
+        | DisplayInside::RubyBase
+        | DisplayInside::RubyBaseContainer
+        | DisplayInside::RubyText
+        | DisplayInside::RubyTextContainer => {
             node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
             // Probably a table caption: ignore
             // println!(

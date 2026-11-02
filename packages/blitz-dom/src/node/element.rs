@@ -34,7 +34,7 @@ use super::svg::SvgImageData;
 use super::{Attribute, Attributes};
 use crate::Document;
 use crate::layout::table::TableContext;
-use crate::node::{TextBrush, TextInputData, TextLayout};
+use crate::node::{LayoutFlow, TextBrush, TextInputData, TextLayout};
 use crate::select_element::SelectDisplay;
 use crate::shadow::ShadowLink;
 
@@ -73,6 +73,10 @@ pub struct ElementData {
     pub background_images: Vec<Option<ImageResourceData>>,
 
     pub mask_images: Vec<Option<ImageResourceData>>,
+
+    /// The `shape-outside` image: a list of at most one layer, so that the code
+    /// loading the background and mask layers loads it too.
+    pub shape_outside_images: Vec<Option<ImageResourceData>>,
 
     /// Parley text layout (elements with inline inner display mode only)
     pub inline_layout_data: Option<Box<TextLayout>>,
@@ -122,6 +126,18 @@ pub struct ElementData {
     /// Detailed grid track sizing information from the most recent layout
     /// (grid containers only). Used by devtools grid inspection.
     pub detailed_grid_info: Option<Box<taffy::DetailedGridInfo<Atom>>>,
+
+    /// The column boxes of the most recent layout (multi-column containers only).
+    /// Used to paint column rules.
+    pub multicol_info: Option<Box<MulticolInfo>>,
+
+    /// The writing mode this box lays its content out in; `style` is in its frame.
+    pub layout_flow: LayoutFlow,
+    /// The flow of the box this one is laid out in.
+    pub parent_layout_flow: LayoutFlow,
+    /// `style` in the layout parent's frame, when the parent's flow differs from this
+    /// box's: the parent's algorithm reads this box's size and margins in its own axes.
+    pub parent_frame_style: Option<Box<Style<Atom>>>,
 
     // Taffy layout data:
     pub style: Style<Atom>,
@@ -238,6 +254,7 @@ impl std::fmt::Debug for ElementData {
             .field("special_data", &self.special_data)
             .field("background_images", &self.background_images)
             .field("mask_images", &self.mask_images)
+            .field("shape_outside_images", &self.shape_outside_images)
             .field("inline_layout_data", &self.inline_layout_data)
             .field("list_item_data", &self.list_item_data)
             .field("template_contents", &self.template_contents)
@@ -263,6 +280,7 @@ impl Clone for ElementData {
             special_data: self.special_data.clone(),
             background_images: self.background_images.clone(),
             mask_images: self.mask_images.clone(),
+            shape_outside_images: self.shape_outside_images.clone(),
             inline_layout_data: self.inline_layout_data.clone(),
             list_item_data: self.list_item_data.clone(),
             template_contents: self.template_contents,
@@ -284,6 +302,10 @@ impl Clone for ElementData {
             before: None,
             after: None,
             detailed_grid_info: None,
+            multicol_info: None,
+            layout_flow: LayoutFlow::HorizontalTb,
+            parent_layout_flow: LayoutFlow::HorizontalTb,
+            parent_frame_style: None,
             style: Default::default(),
             display_constructed_as: StyloDisplay::Block,
             cache: Cache::new(),
@@ -387,6 +409,7 @@ impl ElementData {
             shadow_styles: None,
             background_images: Vec::new(),
             mask_images: Vec::new(),
+            shape_outside_images: Vec::new(),
 
             stylo_element_data: Default::default(),
             selector_flags: Cell::new(ElementSelectorFlags::empty()),
@@ -399,6 +422,10 @@ impl ElementData {
             before: None,
             after: None,
             detailed_grid_info: None,
+            multicol_info: None,
+            layout_flow: LayoutFlow::HorizontalTb,
+            parent_layout_flow: LayoutFlow::HorizontalTb,
+            parent_frame_style: None,
             style: Default::default(),
             display_constructed_as: StyloDisplay::Block,
             cache: Cache::new(),
@@ -786,6 +813,9 @@ pub struct RasterImageData {
     pub height: u32,
     /// The raw image data in RGBA8 format
     pub data: Blob<u8>,
+    /// The EXIF orientation decode already applied to `data`, so `width`/`height` are
+    /// the oriented size.
+    pub orientation: image::metadata::Orientation,
 }
 impl RasterImageData {
     pub fn new(width: u32, height: u32, data: Arc<Vec<u8>>) -> Self {
@@ -793,6 +823,7 @@ impl RasterImageData {
             width,
             height,
             data: Blob::new(data),
+            orientation: image::metadata::Orientation::NoTransforms,
         }
     }
 }
@@ -859,6 +890,19 @@ impl std::fmt::Debug for SpecialElementData {
             SpecialElementData::None => f.write_str("NodeSpecificData::None"),
         }
     }
+}
+
+/// The column boxes of a multi-column container (css-multicol-1), in CSS pixels.
+/// Column `i` starts `i * (column_width + column_gap)` right of `origin`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MulticolInfo {
+    /// The top-left corner of the first column box, relative to the border box.
+    pub origin: taffy::Point<f32>,
+    pub column_width: f32,
+    pub column_gap: f32,
+    pub column_height: f32,
+    /// The columns that hold content, all leading: a rule separates each adjacent pair.
+    pub used_columns: usize,
 }
 
 #[derive(Clone)]

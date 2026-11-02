@@ -5,6 +5,13 @@
 @namespace url(http://www.w3.org/1999/xhtml);
 /* set default namespace to HTML */
 @namespace xul url(http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul);
+@namespace svg url(http://www.w3.org/2000/svg);
+
+/* The SVG UA style sheet of css-transforms-1: SVG elements without a CSS layout box
+ * transform about their user-space origin. */
+svg|*:not(svg|svg), svg|*:not(svg|foreignObject) > svg|svg {
+    transform-origin: 0 0;
+}
 
 @font-face {
     font-family: -moz-bullet-font;
@@ -1120,4 +1127,58 @@ noscript {
         pointer-events: none !important;
         background-color: transparent;
     }
+}
+
+/* The global view transition UA style sheet, css-view-transitions-1 §5 */
+:root {
+    view-transition-name: root;
+}
+
+:root::view-transition {
+    position: fixed;
+    inset: 0;
+}
+
+:root::view-transition-group(*) {
+    position: absolute;
+    top: 0;
+    left: 0;
+
+    animation-duration: 0.25s;
+    animation-fill-mode: both;
+}
+
+:root::view-transition-image-pair(*) {
+    position: absolute;
+    inset: 0;
+
+    animation-duration: inherit;
+    animation-fill-mode: inherit;
+    animation-delay: inherit;
+}
+
+:root::view-transition-old(*),
+:root::view-transition-new(*) {
+    position: absolute;
+    inset-block-start: 0;
+    inline-size: 100%;
+    block-size: auto;
+
+    animation-duration: inherit;
+    animation-fill-mode: inherit;
+    animation-delay: inherit;
+}
+
+/* Default cross-fade transition */
+@keyframes -ua-view-transition-fade-out {
+    to { opacity: 0; }
+}
+@keyframes -ua-view-transition-fade-in {
+    from { opacity: 0; }
+}
+
+/* Keyframes for blending when there are 2 images */
+@keyframes -ua-mix-blend-mode-plus-lighter {
+    from { mix-blend-mode: plus-lighter }
+    to { mix-blend-mode: plus-lighter }
 }

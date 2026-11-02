@@ -1,10 +1,17 @@
 use anyrender::PaintScene;
-use blitz_dom::{BaseDocument, NodeId, node::TextBrush, util::ToColorColor};
+use blitz_dom::{
+    BaseDocument, NodeId,
+    node::{LayoutFlow, TextBrush},
+    util::ToColorColor,
+};
 use kurbo::{Affine, BezPath, Cap, Circle, Rect, Stroke};
 use parley::{Affinity, Cursor, Layout, Line, PositionedLayoutItem, Selection};
 use peniko::Fill;
+use smallvec::SmallVec;
 use std::collections::HashMap;
+use style::properties::ComputedValues;
 use style::properties::generated::longhands::text_decoration_style::computed_value::T as TextDecorationStyle;
+use style::values::computed::font::{FontStyle, FontSynthesis, FontSynthesisStyle};
 use style::values::computed::{
     Length, LengthPercentage, TextDecorationLength, TextDecorationLine, TextUnderlinePosition,
 };
@@ -12,6 +19,10 @@ use style::values::generics::text::{GenericTextDecorationInset, GenericTextDecor
 
 use crate::color::{Color, ToColorColor as _};
 use crate::{FONT_EMBOLDEN_ENABLED, SELECTION_COLOR};
+
+/// The map from a line's layout coordinates to the scene: one transform for horizontal
+/// text, and one per line where vertical lines turn onto the block axis.
+pub(crate) type LineTransform<'a> = &'a dyn Fn(&Line<'_, TextBrush>) -> Affine;
 
 /// Draw the backgrounds of inline elements (e.g. `<span style="background: ...">`).
 ///
@@ -22,14 +33,22 @@ use crate::{FONT_EMBOLDEN_ENABLED, SELECTION_COLOR};
 ///
 /// The inline root's own background is painted separately (as a normal block box), so
 /// runs belonging to the root are skipped to avoid drawing it twice.
+///
+/// `first_line` is the inline root's `::first-line` style: its background covers the runs
+/// of line 1, under those of the inline elements on it.
 pub(crate) fn draw_inline_backgrounds<'a>(
     scene: &mut impl PaintScene,
     lines: impl Iterator<Item = Line<'a, TextBrush>>,
     doc: &BaseDocument,
-    transform: Affine,
+    line_transform: LineTransform<'_>,
     inline_root_id: NodeId,
+    first_line: Option<&ComputedValues>,
 ) {
-    for line in lines {
+    for (line_index, line) in lines.enumerate() {
+        let transform = line_transform(&line);
+        if let Some(first_line) = first_line.filter(|_| line_index == 0) {
+            draw_first_line_background(scene, &line, first_line, transform);
+        }
         for item in line.items() {
             let PositionedLayoutItem::GlyphRun(glyph_run) = item else {
                 continue;
@@ -64,6 +83,44 @@ pub(crate) fn draw_inline_backgrounds<'a>(
 
             scene.fill(Fill::NonZero, transform, bg_color, None, &rect);
         }
+    }
+}
+
+/// Fill the `::first-line` background over `line`'s glyph runs, from the first run's
+/// start to the last run's end and over the tallest run's ascent and descent.
+fn draw_first_line_background(
+    scene: &mut impl PaintScene,
+    line: &Line<'_, TextBrush>,
+    first_line: &ComputedValues,
+    transform: Affine,
+) {
+    let bg_color = first_line
+        .get_background()
+        .background_color
+        .resolve_to_absolute(&first_line.clone_color())
+        .as_srgb_color();
+    if bg_color == Color::TRANSPARENT {
+        return;
+    }
+    let extent = line
+        .items()
+        .filter_map(|item| match item {
+            PositionedLayoutItem::GlyphRun(glyph_run) => {
+                let metrics = glyph_run.run().metrics();
+                let x = glyph_run.offset() as f64;
+                let baseline = glyph_run.baseline() as f64;
+                Some(Rect::new(
+                    x,
+                    baseline - metrics.ascent as f64,
+                    x + glyph_run.advance() as f64,
+                    baseline + metrics.descent as f64,
+                ))
+            }
+            PositionedLayoutItem::InlineBox(_) => None,
+        })
+        .reduce(|extent, run| extent.union(run));
+    if let Some(rect) = extent {
+        scene.fill(Fill::NonZero, transform, bg_color, None, &rect);
     }
 }
 
@@ -148,6 +205,11 @@ struct DecorationStackEntry {
     text_color: Color,
     /// The decoration this node introduces as a decorating box, if any.
     decoration: Option<ResolvedDecoration>,
+    /// Whether `font-synthesis-weight` lets runs of this node draw a synthesized bold.
+    may_synthesize_weight: bool,
+    /// Whether `font-synthesis-style` lets runs of this node draw a synthesized slant:
+    /// `oblique-only` allows it for `oblique` but not for `italic`.
+    may_synthesize_style: bool,
 }
 
 /// Resolve the cached style values for a single node into a [`DecorationStackEntry`].
@@ -157,21 +219,47 @@ fn resolve_decoration_entry(doc: &BaseDocument, node_id: NodeId) -> DecorationSt
             node_id,
             text_color: Color::BLACK,
             decoration: None,
+            may_synthesize_weight: true,
+            may_synthesize_style: true,
         };
     };
 
+    let font = styles.get_font();
+    let may_synthesize_weight = font.font_synthesis_weight == FontSynthesis::Auto;
+    let may_synthesize_style = match font.font_synthesis_style {
+        FontSynthesisStyle::Auto => true,
+        FontSynthesisStyle::None => false,
+        FontSynthesisStyle::ObliqueOnly => font.font_style != FontStyle::ITALIC,
+    };
+
+    let text_color = styles.get_inherited_text().color.as_color_color();
+    // Decorations propagate through the box tree, and a `display: contents` element
+    // generates no box, so its decorations have no effect on descendants.
+    let decoration = if styles.clone_display().is_contents() {
+        None
+    } else {
+        resolve_decoration(&styles)
+    };
+
+    DecorationStackEntry {
+        node_id,
+        text_color,
+        decoration,
+        may_synthesize_weight,
+        may_synthesize_style,
+    }
+}
+
+/// The decoration a box styled `styles` introduces as a decorating box, if any.
+fn resolve_decoration(styles: &ComputedValues) -> Option<ResolvedDecoration> {
     let itext = styles.get_inherited_text();
     let text = styles.get_text();
     let text_color = itext.color.as_color_color();
-
     let drawn_lines = TextDecorationLine::UNDERLINE
         | TextDecorationLine::OVERLINE
         | TextDecorationLine::LINE_THROUGH;
     let line = text.text_decoration_line;
-    // Decorations propagate through the box tree, and a `display: contents` element
-    // generates no box, so its decorations have no effect on descendants.
-    let is_contents = styles.clone_display().is_contents();
-    let decoration = (!is_contents && line.intersects(drawn_lines)).then(|| {
+    line.intersects(drawn_lines).then(|| {
         // `text-decoration-color: currentColor` (the initial value) resolves against
         // the decorating box's own colour, not the descendant run's.
         let color = text
@@ -191,13 +279,7 @@ fn resolve_decoration_entry(doc: &BaseDocument, node_id: NodeId) -> DecorationSt
                 .contains(TextUnderlinePosition::UNDER),
             inset: text.text_decoration_inset.clone(),
         }
-    });
-
-    DecorationStackEntry {
-        node_id,
-        text_color,
-        decoration,
-    }
+    })
 }
 
 /// The run-dependent geometry used to position and size a decoration, captured from a
@@ -538,15 +620,47 @@ fn flush_line_decorations(
     }
 }
 
+/// How far a synthesized bold grows each glyph outline, per side, at `font_size` CSS px.
+/// Skia's fake bold (which Chromium uses): the outline is stroked by `font_size` times a
+/// ratio interpolated from 1/24 at 9px to 1/32 at 36px, clamped outside that range.
+fn synthetic_bold_outset(font_size: f64) -> f64 {
+    const KEYS: (f64, f64) = (9.0, 36.0);
+    const RATIOS: (f64, f64) = (1.0 / 24.0, 1.0 / 32.0);
+    let t = ((font_size - KEYS.0) / (KEYS.1 - KEYS.0)).clamp(0.0, 1.0);
+    let ratio = RATIOS.0 + (RATIOS.1 - RATIOS.0) * t;
+    font_size * ratio / 2.0
+}
+
+/// The outline growth every glyph gets on platforms that thicken text (`font-embolden`), for
+/// a `font_size` in device pixels.
+pub(crate) fn platform_embolden(font_size: f32, scale: f64) -> kurbo::Vec2 {
+    if FONT_EMBOLDEN_ENABLED {
+        let fs = font_size as f64 / scale;
+        kurbo::Vec2::new((0.015125 * fs).min(0.3), (0.0121 * fs).min(0.3))
+    } else {
+        kurbo::Vec2::default()
+    }
+}
+
+/// `first_line` is the inline root's `::first-line` style: on line 1 it gives the colour of
+/// runs that inherit the root's, and its decoration spans the line.
+// The paint state is threaded through as plain arguments, as the callers hold it.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn stroke_text<'a>(
     scene: &mut impl PaintScene,
     lines: impl Iterator<Item = Line<'a, TextBrush>>,
     doc: &BaseDocument,
-    transform: Affine,
+    line_transform: LineTransform<'_>,
     scale: f64,
     inline_root_id: NodeId,
+    first_line: Option<&ComputedValues>,
     context: &mut DrawTextContext,
+    vertical_flow: Option<LayoutFlow>,
 ) {
+    let first_line_color =
+        first_line.map(|style| style.get_inherited_text().color.as_color_color());
+    let first_line_decoration = first_line.and_then(resolve_decoration);
+
     let DrawTextContext {
         stack,
         path_scratch,
@@ -564,24 +678,44 @@ pub(crate) fn stroke_text<'a>(
     // ancestor chain on every run, we cache each node's resolved values here and,
     // for each run, only resolve styles for the nodes newly descended into (popping
     // as we ascend). `path_scratch` is a reusable buffer for the run's node path.
-    for line in lines {
+    for (line_index, line) in lines.enumerate() {
+        let transform = line_transform(&line);
         // Decorations accumulated for this line, keyed by decorating box, so each box is
         // painted once (spanning all its runs) using its own font — matching Firefox, which
         // draws one decoration per box rather than one stepped segment per differently-sized
         // run. Clearing preserves the allocation for the next line and inline context.
         deco_boxes.clear();
+        let is_first_line = line_index == 0;
+        // The fictional `::first-line` box wraps all of line 1, inside the inline root.
+        let mut first_line_box =
+            first_line_decoration
+                .clone()
+                .filter(|_| is_first_line)
+                .map(|deco| LineDecoration {
+                    node_id: inline_root_id,
+                    deco,
+                    min_x: f64::INFINITY,
+                    max_x: f64::NEG_INFINITY,
+                    own: None,
+                    first: None,
+                });
 
+        // The run the last glyph run belonged to, and how many of its glyphs drew so far.
+        let mut run_glyphs: Option<(usize, usize)> = None;
         for item in line.items() {
             if let PositionedLayoutItem::GlyphRun(glyph_run) = item {
                 let run = glyph_run.run();
+                let glyph_count = glyph_run.glyphs().count();
+                let glyph_start = match run_glyphs {
+                    Some((index, drawn)) if index == run.index() => drawn,
+                    _ => 0,
+                };
+                run_glyphs = Some((run.index(), glyph_start + glyph_count));
                 let font = run.font();
                 let font_size = run.font_size();
                 let metrics = run.metrics();
                 let style = glyph_run.style();
                 let synthesis = run.synthesis();
-                let glyph_xform = synthesis
-                    .skew()
-                    .map(|angle| Affine::skew(angle.to_radians().tan() as f64, 0.0));
 
                 let css_font_size = font_size as f64 / scale;
 
@@ -611,32 +745,104 @@ pub(crate) fn stroke_text<'a>(
 
                 // The glyph colour comes from the run's own node (the stack top): `color`
                 // inherits, so the innermost inline element already carries the right value.
-                let text_color = stack.last().map(|e| e.text_color).unwrap_or(Color::BLACK);
+                let run_node = stack.last();
+                let mut text_color = run_node.map(|e| e.text_color).unwrap_or(Color::BLACK);
+                // A run that inherits the root's colour inherits the first line's on line 1.
+                if let Some(color) = first_line_color.filter(|_| is_first_line)
+                    && stack
+                        .first()
+                        .is_some_and(|root| root.text_color == text_color)
+                {
+                    text_color = color;
+                }
+                let may_synthesize_weight = run_node.is_none_or(|e| e.may_synthesize_weight);
+                let may_synthesize_style = run_node.is_none_or(|e| e.may_synthesize_style);
 
-                let embolden = if FONT_EMBOLDEN_ENABLED {
-                    let fs = font_size as f64 / scale;
-                    kurbo::Vec2::new((0.015125 * fs).min(0.3), (0.0121 * fs).min(0.3))
-                } else {
-                    kurbo::Vec2::default()
+                let glyph_xform = synthesis
+                    .skew()
+                    .filter(|_| may_synthesize_style)
+                    .map(|angle| Affine::skew(angle.to_radians().tan() as f64, 0.0));
+
+                let mut embolden = platform_embolden(font_size, scale);
+                if synthesis.embolden() && may_synthesize_weight {
+                    let outset = synthetic_bold_outset(font_size as f64 / scale);
+                    embolden += kurbo::Vec2::new(outset, outset);
+                }
+
+                let upright_centres = vertical_flow.and_then(|flow| {
+                    let orientation = doc
+                        .get_node(style.brush.id)
+                        .and_then(|node| node.primary_styles())
+                        .map(|styles| styles.clone_text_orientation())?;
+                    let centres = crate::vertical_text::upright_cell_centres(
+                        &glyph_run,
+                        glyph_start,
+                        flow,
+                        orientation,
+                    );
+                    centres.iter().any(Option::is_some).then_some(centres)
+                });
+                let palette_font = doc
+                    .get_node(style.brush.id)
+                    .and_then(|node| node.primary_styles())
+                    .and_then(|styles| crate::font_palette::resolve(doc, &styles, font))
+                    .map(|palette| crate::font_palette::font_with_palette(font, palette));
+                let glyph_font = palette_font.as_ref().unwrap_or(font);
+                let to_glyph = |glyph: parley::Glyph| anyrender::Glyph {
+                    id: glyph.id as _,
+                    x: glyph.x,
+                    y: glyph.y,
                 };
-
-                scene.draw_glyphs(
-                    font,
-                    font_size,
-                    !FONT_EMBOLDEN_ENABLED, // hint
-                    run.normalized_coords(),
-                    embolden,
-                    Fill::NonZero,
-                    &anyrender::Paint::from(text_color),
-                    1.0, // alpha
-                    transform,
-                    glyph_xform,
-                    glyph_run.positioned_glyphs().map(|glyph| anyrender::Glyph {
-                        id: glyph.id as _,
-                        x: glyph.x,
-                        y: glyph.y,
-                    }),
-                );
+                match &upright_centres {
+                    None => scene.draw_glyphs(
+                        glyph_font,
+                        font_size,
+                        !FONT_EMBOLDEN_ENABLED, // hint
+                        run.normalized_coords(),
+                        embolden,
+                        Fill::NonZero,
+                        &anyrender::Paint::from(text_color),
+                        1.0, // alpha
+                        transform,
+                        glyph_xform,
+                        glyph_run.positioned_glyphs().map(to_glyph),
+                    ),
+                    // Sideways glyphs draw as one run; each upright glyph turns about its cell.
+                    Some(centres) => {
+                        let mut draw = |transform: Affine, glyphs: &[anyrender::Glyph]| {
+                            scene.draw_glyphs(
+                                glyph_font,
+                                font_size,
+                                !FONT_EMBOLDEN_ENABLED, // hint
+                                run.normalized_coords(),
+                                embolden,
+                                Fill::NonZero,
+                                &anyrender::Paint::from(text_color),
+                                1.0, // alpha
+                                transform,
+                                glyph_xform,
+                                glyphs.iter().copied(),
+                            );
+                        };
+                        let glyphs = glyph_run.positioned_glyphs().zip(centres);
+                        let sideways: SmallVec<[anyrender::Glyph; 64]> = glyphs
+                            .clone()
+                            .filter(|(_, centre)| centre.is_none())
+                            .map(|(glyph, _)| to_glyph(glyph))
+                            .collect();
+                        draw(transform, &sideways);
+                        for (glyph, centre) in glyphs {
+                            if let Some(centre) = centre {
+                                draw(
+                                    crate::vertical_text::upright_glyph_transform(
+                                        transform, *centre,
+                                    ),
+                                    &[to_glyph(glyph)],
+                                );
+                            }
+                        }
+                    }
+                }
 
                 // Accumulate this run's contribution to each decorating box on its ancestor
                 // path. The decoration is drawn once per box after the whole line has been
@@ -687,9 +893,28 @@ pub(crate) fn stroke_text<'a>(
                         acc.own = Some(geometry.clone());
                     }
                 }
+                if let Some(acc) = &mut first_line_box {
+                    acc.min_x = acc.min_x.min(run_x0);
+                    acc.max_x = acc.max_x.max(run_x1);
+                    if acc.first.is_none() {
+                        acc.first = Some(geometry.clone());
+                    }
+                    if run_node_id == inline_root_id {
+                        acc.own = Some(geometry);
+                    }
+                }
             }
         }
 
+        if let Some(acc) = first_line_box {
+            // Just inside the inline root's own decoration, which is the first box when set.
+            let index = usize::from(
+                deco_boxes
+                    .first()
+                    .is_some_and(|d| d.node_id == inline_root_id),
+            );
+            deco_boxes.insert(index, acc);
+        }
         flush_line_decorations(scene, transform, scale, deco_boxes, win_ascent_ratios);
     }
 }
@@ -699,7 +924,7 @@ pub(crate) fn stroke_text<'a>(
 pub(crate) fn draw_text_selection(
     scene: &mut impl PaintScene,
     layout: &Layout<TextBrush>,
-    transform: Affine,
+    line_transform: LineTransform<'_>,
     selection_start: usize,
     selection_end: usize,
 ) {
@@ -707,8 +932,17 @@ pub(crate) fn draw_text_selection(
     let focus = Cursor::from_byte_index(layout, selection_end, Affinity::Downstream);
     let selection = Selection::new(anchor, focus);
 
-    selection.geometry_with(layout, |rect, _line_idx| {
+    selection.geometry_with(layout, |rect, line_idx| {
+        let Some(line) = layout.get(line_idx) else {
+            return;
+        };
         let rect = kurbo::Rect::new(rect.x0, rect.y0, rect.x1, rect.y1);
-        scene.fill(Fill::NonZero, transform, SELECTION_COLOR, None, &rect);
+        scene.fill(
+            Fill::NonZero,
+            line_transform(&line),
+            SELECTION_COLOR,
+            None,
+            &rect,
+        );
     });
 }

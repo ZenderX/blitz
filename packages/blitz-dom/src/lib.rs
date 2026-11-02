@@ -39,6 +39,8 @@ mod document;
 /// The nodes themsleves, and their data.
 pub mod node;
 
+mod animation_snapshot;
+pub mod basic_shape;
 mod config;
 mod debug;
 mod events;
@@ -69,6 +71,8 @@ mod traversal;
 mod tree;
 
 mod url;
+/// The view transition pseudo-element tree.
+mod view_transition;
 
 pub use stylo_to_kurbo::resolve_2d_transform;
 
@@ -82,6 +86,7 @@ pub use crate::layout::replaced::IntrinsicSizes;
 #[cfg(feature = "custom-widget")]
 pub use crate::node::Widget;
 
+pub use animation_snapshot::{AnimationSnapshot, AnimationSource};
 pub use blitz_traits::node_id::NodeId;
 pub use config::{DocumentConfig, StyleThreading};
 pub use document::{AdoptedSheetId, BaseDocument, DocGuard, DocGuardMut, Document, PlainDocument};
@@ -92,10 +97,13 @@ pub use markup5ever::{
 pub use mutator::DocumentMutator;
 pub use node::{Attribute, DocumentData, ElementData, Node, NodeData, TextNodeData};
 pub use parley::FontContext;
-pub use scrolling::{ScrollBehavior, ScrollLogicalPosition};
+pub use scrolling::{ScrollBehavior, ScrollLogicalPosition, ScrollSides};
 pub use select_element::{SELECT_ARROW_WIDTH_EM, SelectDisplay};
 pub use shadow::{AttachShadowError, ShadowLink};
 pub use tree::NodeTree;
+pub use view_transition::{
+    CapturedGeometry, ViewTransitionCapture, ViewTransitionGroupStyles, ViewTransitionTree,
+};
 
 /// Convert a Blitz [`NodeId`] into a [`taffy::NodeId`] (which wraps a `u64`).
 #[inline]

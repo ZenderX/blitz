@@ -109,6 +109,8 @@ parley = { version = "0.11.1", default-features = false, features = ["std"] }
 skrifa = { version = "0.44", default-features = false, features = [
     "std",
 ] } # Should match parley and vello versions
+# The emoji properties for `font-variant-emoji`; parley already links this copy.
+icu_properties = { version = "2.1.2", default-features = false, features = ["compiled_data"] }
 
 # AnyRender
 anyrender = { version = "0.13.0" }
@@ -127,6 +129,7 @@ peniko = "0.6.0"
 kurbo = "0.13.1"
 wgpu = "29"
 usvg = "0.48.1"
+resvg = { version = "0.48.1", default-features = false } # Should match usvg's version
 svgtypes = "0.16.1" # Should match usvg's version
 
 # Windowing & Input
@@ -278,8 +281,29 @@ wgpu = { workspace = true }
 wgpu_context = { workspace = true }
 rustc-hash = { workspace = true }
 
+# Loki's stylo, taffy and parley forks, which the blitz `loki/*` branches build on.
+# Every crate of one fork comes from the same branch: patching only some of a
+# workspace's crates builds two copies that share no types.
+[patch.crates-io]
+stylo = { git = "https://github.com/ZenderX/stylo.git", branch = "loki/css-gaps" }
+stylo_atoms = { git = "https://github.com/ZenderX/stylo.git", branch = "loki/css-gaps" }
+stylo_derive = { git = "https://github.com/ZenderX/stylo.git", branch = "loki/css-gaps" }
+stylo_dom = { git = "https://github.com/ZenderX/stylo.git", branch = "loki/css-gaps" }
+stylo_malloc_size_of = { git = "https://github.com/ZenderX/stylo.git", branch = "loki/css-gaps" }
+stylo_static_prefs = { git = "https://github.com/ZenderX/stylo.git", branch = "loki/css-gaps" }
+stylo_traits = { git = "https://github.com/ZenderX/stylo.git", branch = "loki/css-gaps" }
+selectors = { git = "https://github.com/ZenderX/stylo.git", branch = "loki/css-gaps" }
+servo_arc = { git = "https://github.com/ZenderX/stylo.git", branch = "loki/css-gaps" }
+to_shmem = { git = "https://github.com/ZenderX/stylo.git", branch = "loki/css-gaps" }
+to_shmem_derive = { git = "https://github.com/ZenderX/stylo.git", branch = "loki/css-gaps" }
+taffy = { git = "https://github.com/ZenderX/taffy.git", branch = "loki/subgrid" }
+parley = { git = "https://github.com/ZenderX/parley.git", branch = "loki/last-line-align" }
+fontique = { git = "https://github.com/ZenderX/parley.git", branch = "loki/last-line-align" }
+parlance = { git = "https://github.com/ZenderX/parley.git", branch = "loki/last-line-align" }
+parley_data = { git = "https://github.com/ZenderX/parley.git", branch = "loki/last-line-align" }
+
 # [patch.crates-io]
-# anyrender = { path = "../anyrender/crates/anyrender" }
+# anyrender ={ path = "../anyrender/crates/anyrender" }
 # anyrender_skia = { path = "../anyrender/crates/anyrender_skia" }
 # anyrender_vello = { path = "../anyrender/crates/anyrender_vello" }
 # anyrender_vello_cpu = { path = "../anyrender/crates/anyrender_vello_cpu" }
