@@ -536,8 +536,19 @@ impl DocumentMutator<'_> {
             self.mutations_occurred |= node_is_in_document;
             let parent = &mut self.doc.nodes[parent_id];
             parent.insert_damage(ALL_DAMAGE);
+
+            // TODO: make this fine grained / conditional based on ElementSelectorFlags
+            if node_is_in_document {
+                if let Some(mut data) = parent
+                    .stylo_element_data_opt_mut()
+                    .and_then(|s| s.get_mut())
+                {
+                    data.hint |= RestyleHint::restyle_subtree();
+                }
+            }
             // Mark ancestors dirty so the style traversal visits this subtree.
             parent.mark_ancestors_dirty();
+
             parent.children.retain(|id| *id != node_id);
             self.doc.invalidate_flat_tree_for_child_change(parent_id);
             self.maybe_record_node(parent_id);

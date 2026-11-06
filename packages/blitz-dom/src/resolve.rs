@@ -18,7 +18,11 @@ thread_local! {
     pub(crate) static LAYOUT_CTX: RefCell<Option<Box<LayoutContext<TextBrush>>>> = const { RefCell::new(None) };
 }
 
+use app_units::Au;
+use std::collections::HashMap;
+use style::invalidation::element::restyle_hints::RestyleHint;
 use style::selector_parser::RestyleDamage;
+use style::values::computed::ContainerType;
 use taffy::AvailableSpace;
 
 use crate::{
@@ -33,6 +37,17 @@ use crate::{
     },
     node::TextBrush,
 };
+
+/// The content-box width and height of a size container. An axis the container does not
+/// contain is `None`.
+pub(crate) type ContainerExtent = euclid::default::Size2D<Option<Au>>;
+
+pub(crate) fn content_extent(layout: &taffy::Layout) -> ContainerExtent {
+    ContainerExtent::new(
+        Some(Au::from_f32_px(layout.content_box_width())),
+        Some(Au::from_f32_px(layout.content_box_height())),
+    )
+}
 
 impl BaseDocument {
     /// Restyle the tree and then relayout it
@@ -75,48 +90,57 @@ impl BaseDocument {
         let root_node_id = self.root_element().id;
         debug_timer!(timer, feature = "log-phase-times");
 
-        // we need to resolve stylist first since it will need to drive our layout bits
-        self.resolve_stylist(current_time_for_animations);
-        self.resolve_view_transition();
-        timer.record_time("style");
+        // The second pass exists only for `@container` size queries, which read the layout
+        // the first pass produced. It runs at most once so a query that keeps resizing its
+        // own container cannot loop; the next resolve picks up whatever is still unsettled.
+        for is_container_pass in [false, true] {
+            // we need to resolve stylist first since it will need to drive our layout bits
+            self.resolve_stylist(current_time_for_animations);
+            self.resolve_view_transition();
+            timer.record_time("style");
 
-        // Before damage propagation, which carries the damage of changed counter text
-        self.resolve_counters();
-        timer.record_time("counters");
+            // Before damage propagation, which carries the damage of changed counter text
+            self.resolve_counters();
+            timer.record_time("counters");
 
-        // Propagate damage flags (from mutation and restyles) up and down the tree
-        if self.incremental_layout {
-            self.propagate_damage_flags(root_node_id, RestyleDamage::empty());
-            timer.record_time("damage");
-        }
+            // Propagate damage flags (from mutation and restyles) up and down the tree
+            if self.incremental_layout {
+                self.propagate_damage_flags(root_node_id, RestyleDamage::empty());
+                timer.record_time("damage");
+            }
 
-        // Fix up tree for layout (insert anonymous blocks as necessary, etc)
-        self.resolve_layout_children();
-        timer.record_time("construct");
+            // Fix up tree for layout (insert anonymous blocks as necessary, etc)
+            self.resolve_layout_children();
+            timer.record_time("construct");
 
-        self.resolve_deferred_tasks();
-        // Flush background/mask images from style to dedicated storage on the
-        // nodes whose style changed (queued by the style traversal and by
-        // pseudo-element box construction), fetching any not-yet-loaded images.
-        self.flush_pending_style_images();
-        #[cfg(feature = "svg")]
-        for node_id in std::mem::take(&mut self.pending_svg_reparse_nodes) {
-            // The node may have been removed between queueing and now
-            if self.nodes.contains_key(node_id) {
-                crate::layout::construct::parse_inline_svg(self, node_id);
+            self.resolve_deferred_tasks();
+            // Flush background/mask images from style to dedicated storage on the
+            // nodes whose style changed (queued by the style traversal and by
+            // pseudo-element box construction), fetching any not-yet-loaded images.
+            self.flush_pending_style_images();
+            #[cfg(feature = "svg")]
+            for node_id in std::mem::take(&mut self.pending_svg_reparse_nodes) {
+                // The node may have been removed between queueing and now
+                if self.nodes.contains_key(node_id) {
+                    crate::layout::construct::parse_inline_svg(self, node_id);
+                }
+            }
+            #[cfg(not(feature = "svg"))]
+            self.pending_svg_reparse_nodes.clear();
+            timer.record_time("pconstruct");
+
+            // Merge stylo into taffy
+            self.flush_styles_to_layout(root_node_id);
+            timer.record_time("flush");
+
+            // Next we resolve layout with the data resolved by stlist
+            self.resolve_layout();
+            timer.record_time("layout");
+
+            if is_container_pass || !self.restyle_resized_size_containers() {
+                break;
             }
         }
-        #[cfg(not(feature = "svg"))]
-        self.pending_svg_reparse_nodes.clear();
-        timer.record_time("pconstruct");
-
-        // Merge stylo into taffy
-        self.flush_styles_to_layout(root_node_id);
-        timer.record_time("flush");
-
-        // Next we resolve layout with the data resolved by stlist
-        self.resolve_layout();
-        timer.record_time("layout");
 
         // Resolve transforms
         self.resolve_transforms(root_node_id);
@@ -396,8 +420,55 @@ impl BaseDocument {
         self.layout_fixed_boxes();
         taffy::round_layout(self, root_element_id);
         self.map_vertical_layouts(self.root_element().id);
+        self.layout_sticky_boxes();
 
         // println!("\n\n");
         // taffy::print_tree(self, root_node_id)
+    }
+
+    /// Restyle the descendants of every size container whose contained axes changed since
+    /// the style pass last read them: stylo does not track container sizes, and the
+    /// `@container` rules of those descendants were matched against the old size. Returns
+    /// whether any container was marked.
+    fn restyle_resized_size_containers(&mut self) -> bool {
+        let mut sizes = HashMap::new();
+        let mut resized = Vec::new();
+        for (node_id, node) in self.nodes.iter() {
+            let (Some(element), Some(style)) = (node.element_data(), node.primary_styles()) else {
+                continue;
+            };
+            let container_type = style.get_box().clone_container_type();
+            let extent = content_extent(&element.unrounded_layout);
+            let contained = if container_type.intersects(ContainerType::SIZE) {
+                extent
+            } else if container_type.intersects(ContainerType::INLINE_SIZE) {
+                if style.writing_mode.is_horizontal() {
+                    ContainerExtent::new(extent.width, None)
+                } else {
+                    ContainerExtent::new(None, extent.height)
+                }
+            } else {
+                continue;
+            };
+            // A container the style pass has not seen was styled against an unlaid-out box
+            let unseen = ContainerExtent::new(
+                contained.width.map(|_| Au(0)),
+                contained.height.map(|_| Au(0)),
+            );
+            let seen = self
+                .container_query_sizes
+                .get(&node_id)
+                .copied()
+                .unwrap_or(unseen);
+            if contained != seen {
+                resized.push(node_id);
+            }
+            sizes.insert(node_id, contained);
+        }
+        self.container_query_sizes = sizes;
+        for &node_id in &resized {
+            self.nodes[node_id].set_restyle_hint(RestyleHint::RESTYLE_DESCENDANTS);
+        }
+        !resized.is_empty()
     }
 }

@@ -34,6 +34,7 @@ pub(crate) mod replaced;
 pub(crate) mod ruby;
 #[cfg(feature = "floats")]
 pub(crate) mod shape_outside;
+pub(crate) mod sticky;
 #[cfg(feature = "svg")]
 pub(crate) mod svg_source;
 pub(crate) mod table;

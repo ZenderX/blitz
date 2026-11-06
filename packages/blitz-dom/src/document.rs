@@ -296,6 +296,9 @@ pub struct BaseDocument {
     /// When each scroll container's overlay scrollbars were last shown
     /// (scrolled, or the pointer left the thumb); drives their fade-out
     pub(crate) scrollbar_activity: HashMap<NodeId, Instant>,
+    /// The content-box extent of each size container as the last style pass saw it
+    /// (`query_container_size`), to detect the resize that must restyle its descendants
+    pub(crate) container_query_sizes: HashMap<NodeId, crate::resolve::ContainerExtent>,
     /// Whether and what kind of scroll animation is currently in progress
     pub(crate) scroll_animation: ScrollAnimationState,
     /// The user scroll gesture in progress, which snaps its scrollers when it ends
@@ -702,6 +705,7 @@ impl BaseDocument {
             resize_drag: None,
             hovered_scrollbar: None,
             scrollbar_activity: HashMap::new(),
+            container_query_sizes: HashMap::new(),
             scroll_animation: ScrollAnimationState::None,
             scroll_gesture: ScrollGesture::default(),
             text_selection: TextSelection::default(),
@@ -1788,6 +1792,10 @@ impl BaseDocument {
                 // TODO: see if we can only invalidate if resolved fonts may have changed
                 self.invalidate_inline_contexts();
             }
+            Resource::ImportedStylesheet => {
+                // The sheet was written into its `@import` rule behind stylo's back
+                self.force_all_sheets_dirty(OriginSet::all());
+            }
             Resource::None => {
                 // Do nothing
             }
@@ -2564,9 +2572,13 @@ impl BaseDocument {
             };
             self.stylist.set_device(device, &guards)
         };
+        self.force_all_sheets_dirty(origins);
+    }
+
+    /// Make the next style flush re-collect `origins` in the document and every shadow tree
+    fn force_all_sheets_dirty(&mut self, origins: OriginSet) {
         self.stylist.force_stylesheet_origins_dirty(origins);
 
-        // Media queries in shadow sheets depend on the device as well
         for &root_id in self.shadow_sheet_roots.values() {
             if let Some(styles) = self
                 .nodes

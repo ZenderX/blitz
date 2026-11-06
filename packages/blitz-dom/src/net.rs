@@ -71,6 +71,8 @@ pub enum Resource {
     Font(Bytes, FontFaceOverrides),
     /// HTML fetched for an `<iframe>` element's `src`
     DocumentSrc(String),
+    /// An `@import`ed stylesheet that was parsed straight into its import rule
+    ImportedStylesheet,
     None,
 }
 
@@ -302,7 +304,7 @@ impl NetHandler for ResourceHandler<NestedStylesheetHandler> {
         self.data.import_rule.write_with(&mut guard).stylesheet = ImportSheet::Sheet(sheet);
         drop(guard);
 
-        self.respond(resolved_url, Ok(Resource::None))
+        self.respond(resolved_url, Ok(Resource::ImportedStylesheet))
     }
 }
 

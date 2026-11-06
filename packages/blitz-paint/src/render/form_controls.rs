@@ -5,6 +5,15 @@ use blitz_dom::{SELECT_ARROW_WIDTH_EM, local_name};
 use kurbo::{Affine, BezPath, Cap, Circle, Join, Point, Rect, RoundedRect, Stroke, Vec2};
 use peniko::Fill;
 use style::dom::TElement as _;
+use style::values::computed::ColorOrAuto;
+
+/// Chrome's light-scheme accent colour for `accent-color: auto`.
+const AUTO_ACCENT_COLOR: Color = Color::from_rgba8(0, 117, 255, 255);
+
+const DISABLED_COLOR: Color = Color::from_rgba8(209, 209, 209, 255);
+
+/// Chrome's unchecked checkbox border, independent of `accent-color`.
+const UNCHECKED_BORDER_COLOR: Color = Color::from_rgba8(118, 118, 118, 255);
 
 impl ElementCx<'_, '_> {
     pub(super) fn draw_input(&self, scene: &mut impl PaintScene) {
@@ -18,11 +27,16 @@ impl ElementCx<'_, '_> {
         let type_attr = self.node.attr(local_name!("type"));
         let disabled = self.node.attr(local_name!("disabled")).is_some();
 
-        // TODO this should be coming from css accent-color, but I couldn't find how to retrieve it
         let accent_color = if disabled {
-            Color::from_rgba8(209, 209, 209, 255)
+            DISABLED_COLOR
         } else {
-            self.style.clone_color().as_srgb_color()
+            match &self.style.get_inherited_ui().accent_color {
+                ColorOrAuto::Auto => AUTO_ACCENT_COLOR,
+                ColorOrAuto::Color(accent) => {
+                    let current = self.style.get_inherited_text().color;
+                    accent.resolve_to_absolute(&current).as_srgb_color()
+                }
+            }
         };
 
         let width = self.frame.border_box.width();
@@ -34,7 +48,20 @@ impl ElementCx<'_, '_> {
 
         match type_attr {
             Some("checkbox") => {
-                draw_checkbox(scene, checked, frame, self.transform, accent_color, scale);
+                let border_color = if disabled {
+                    DISABLED_COLOR
+                } else {
+                    UNCHECKED_BORDER_COLOR
+                };
+                draw_checkbox(
+                    scene,
+                    checked,
+                    frame,
+                    self.transform,
+                    accent_color,
+                    border_color,
+                    scale,
+                );
             }
             Some("radio") => {
                 let center = frame.center();
@@ -109,6 +136,7 @@ fn draw_checkbox(
     frame: RoundedRect,
     transform: Affine,
     accent_color: Color,
+    border_color: Color,
     scale: f64,
 ) {
     if checked {
@@ -134,7 +162,7 @@ fn draw_checkbox(
         scene.stroke(&style, transform, Color::WHITE, None, &path);
     } else {
         scene.fill(Fill::NonZero, transform, Color::WHITE, None, &frame);
-        scene.stroke(&Stroke::default(), transform, accent_color, None, &frame);
+        scene.stroke(&Stroke::default(), transform, border_color, None, &frame);
     }
 }
 

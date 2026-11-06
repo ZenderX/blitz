@@ -1366,10 +1366,17 @@ impl<'a> TElement for BlitzNode<'a> {
 
     fn query_container_size(
         &self,
-        _display: &style::values::specified::Display,
-    ) -> euclid::default::Size2D<Option<app_units::Au>> {
-        // FIXME: Implement container queries. For now this effectively disables them without panicking.
-        Default::default()
+        display: &style::values::specified::Display,
+    ) -> crate::resolve::ContainerExtent {
+        // Boxless and inline-level elements cannot be size containers
+        if display.is_none() || display.is_contents() || display.is_inline_flow() {
+            return Default::default();
+        }
+        // The last layout: a resize shows up in the restyle `BaseDocument::resolve` runs after layout
+        match self.element_data() {
+            Some(element) => crate::resolve::content_extent(&element.unrounded_layout),
+            None => Default::default(),
+        }
     }
 
     fn each_custom_state<F>(&self, _callback: F)

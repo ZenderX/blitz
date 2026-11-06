@@ -82,11 +82,12 @@ impl<T: Deref<Target = ComputedValues>> taffy::CoreStyle for TaffyStyloStyle<T> 
     #[inline]
     fn inset(&self) -> taffy::Rect<taffy::LengthPercentageAuto> {
         let position_styles = self.0.get_position();
+        let position = self.0.get_box().position;
         taffy::Rect {
-            left: convert::inset(&position_styles.left),
-            right: convert::inset(&position_styles.right),
-            top: convert::inset(&position_styles.top),
-            bottom: convert::inset(&position_styles.bottom),
+            left: convert::box_inset(position, &position_styles.left),
+            right: convert::box_inset(position, &position_styles.right),
+            top: convert::box_inset(position, &position_styles.top),
+            bottom: convert::box_inset(position, &position_styles.bottom),
         }
     }
 
