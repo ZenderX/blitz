@@ -184,6 +184,20 @@ pub fn inset(val: &stylo::InsetVal) -> taffy::LengthPercentageAuto {
     }
 }
 
+/// An inset as taffy lays it out for a box with `position`. A sticky box is laid out in
+/// flow, as `taffy::Position::Relative` would, but its insets are not a relative offset:
+/// the sticky pass in `blitz-dom` applies them after layout.
+#[inline]
+pub fn box_inset(position: stylo::Position, val: &stylo::InsetVal) -> taffy::LengthPercentageAuto {
+    match position {
+        stylo::Position::Sticky => taffy::LengthPercentageAuto::AUTO,
+        stylo::Position::Static
+        | stylo::Position::Relative
+        | stylo::Position::Absolute
+        | stylo::Position::Fixed => inset(val),
+    }
+}
+
 #[inline]
 pub fn is_block(input: stylo::Display) -> bool {
     matches!(input.outside(), stylo::DisplayOutside::Block)
@@ -262,9 +276,11 @@ pub fn position(input: stylo::Position) -> taffy::Position {
         stylo::Position::Relative => taffy::Position::Relative,
         stylo::Position::Static => taffy::Position::Relative,
 
-        // TODO: support position:fixed and sticky
+        // Fixed boxes are re-laid out against their containing block by `blitz-dom`
         stylo::Position::Absolute => taffy::Position::Absolute,
         stylo::Position::Fixed => taffy::Position::Absolute,
+
+        // In flow; the offset toward the scrollport is `blitz-dom`'s sticky pass
         stylo::Position::Sticky => taffy::Position::Relative,
     }
 }
@@ -799,11 +815,14 @@ pub fn to_taffy_style(style: &stylo::ComputedValues) -> taffy::Style<Atom> {
         },
         aspect_ratio: self::aspect_ratio(pos.aspect_ratio),
 
-        inset: taffy::Rect {
-            left: self::inset(&pos.left),
-            right: self::inset(&pos.right),
-            top: self::inset(&pos.top),
-            bottom: self::inset(&pos.bottom),
+        inset: {
+            let position = style.clone_position();
+            taffy::Rect {
+                left: self::box_inset(position, &pos.left),
+                right: self::box_inset(position, &pos.right),
+                top: self::box_inset(position, &pos.top),
+                bottom: self::box_inset(position, &pos.bottom),
+            }
         },
         margin: taffy::Rect {
             left: self::margin(&margin.margin_left),
