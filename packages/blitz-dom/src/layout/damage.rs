@@ -1,6 +1,7 @@
 use blitz_traits::node_id::NodeId;
 use std::ops::Range;
 
+use super::fixed::establishes_fixed_containing_block;
 use super::writing_mode;
 use crate::Node;
 use crate::net::ResourceHandler;
@@ -13,14 +14,14 @@ use style::properties::generated::longhands::position::computed_value::T as Posi
 use style::selector_parser::RestyleDamage;
 use style::url::ComputedUrl;
 use style::values::computed::Float;
+use style::values::computed::Overflow;
 use style::values::computed::basic_shape::ClipPath;
 use style::values::computed::image::Image as ComputedImage;
-use style::values::computed::{Overflow, Perspective, Rotate};
 use style::values::generics::basic_shape::ShapeOutside;
 use style::values::generics::image::Image as StyloImage;
-use style::values::generics::transform::{Scale, Translate};
 use style::values::specified::align::AlignFlags;
-use style::values::specified::box_::{Contain, DisplayInside, DisplayOutside, WillChangeBits};
+use style::values::specified::box_::DisplayInside;
+use style::values::specified::box_::DisplayOutside;
 use taffy::Rect;
 
 pub(crate) const CONSTRUCT_BOX: RestyleDamage =
@@ -796,25 +797,10 @@ impl BaseDocument {
 /// `transform` only from the second flush.
 fn confines_descendants(style: &ComputedValues) -> bool {
     let box_style = style.get_box();
-    let effects = style.get_effects();
-    !matches!(box_style.overflow_x, Overflow::Visible)
+    establishes_fixed_containing_block(style)
+        || !matches!(box_style.overflow_x, Overflow::Visible)
         || !matches!(box_style.overflow_y, Overflow::Visible)
-        || box_style
-            .contain
-            .intersects(Contain::LAYOUT | Contain::PAINT)
-        || !box_style.transform.0.is_empty()
-        || !matches!(box_style.translate, Translate::None)
-        || !matches!(box_style.rotate, Rotate::None)
-        || !matches!(box_style.scale, Scale::None)
-        || !matches!(box_style.perspective, Perspective::None)
-        || box_style.will_change.bits.intersects(
-            WillChangeBits::TRANSFORM
-                | WillChangeBits::PERSPECTIVE
-                | WillChangeBits::CONTAIN
-                | WillChangeBits::FIXPOS_CB_NON_SVG,
-        )
-        || !effects.filter.0.is_empty()
-        || !effects.backdrop_filter.0.is_empty()
+        || !style.get_effects().backdrop_filter.0.is_empty()
         || !matches!(style.clone_clip_path(), ClipPath::None)
         || style
             .get_svg()

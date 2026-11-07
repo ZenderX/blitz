@@ -16,22 +16,20 @@
 //! Only the viewport's scroll is cancelled: a fixed box still moves with the scroll offset
 //! of an ancestor scroll container, and with an ancestor's sticky shift.
 
-use crate::layout::damage::HoistedPaintChildren;
 use crate::layout::inline::layout_abspos_child;
 use crate::node::Node;
 use crate::{BaseDocument, NodeId};
+use style::properties::ComputedValues;
 use style::properties::generated::longhands::position::computed_value::T as Position;
 use style::values::computed::{Perspective, Rotate};
 use style::values::generics::transform::{Scale, Translate};
 use style::values::specified::box_::{Contain, DisplayOutside, WillChangeBits};
 
-/// Whether `node` is the containing block for its `position: fixed` descendants:
-/// `transform` (or `translate`/`rotate`/`scale`), `perspective` or `filter` other than
-/// none, `contain: paint | layout | strict | content`, or a `will-change` naming one.
-fn establishes_fixed_containing_block(node: &Node) -> bool {
-    let Some(style) = node.primary_styles() else {
-        return false;
-    };
+/// Whether a box of this style is the containing block for its `position: fixed`
+/// descendants: `transform` (or `translate`/`rotate`/`scale`), `perspective` or `filter`
+/// other than none, `contain: paint | layout | strict | content`, or a `will-change` naming
+/// one.
+pub(super) fn establishes_fixed_containing_block(style: &ComputedValues) -> bool {
     let box_style = style.get_box();
     !box_style.transform.0.is_empty()
         || !matches!(box_style.translate, Translate::None)
@@ -53,21 +51,6 @@ fn establishes_fixed_containing_block(node: &Node) -> bool {
 fn is_fixed_positioned(node: &Node) -> bool {
     node.primary_styles()
         .is_some_and(|style| matches!(style.clone_position(), Position::Fixed))
-}
-
-/// Grow a stacking context's content area, which was computed before this layout, to cover
-/// the box `id` if it is hoisted there.
-fn widen_content_area(context: &mut HoistedPaintChildren, id: NodeId, layout: &taffy::Layout) {
-    let Some(child) = context.children.iter().find(|child| child.node_id == id) else {
-        return;
-    };
-    let left = child.position.x + layout.location.x;
-    let top = child.position.y + layout.location.y;
-    let area = &mut context.content_area;
-    area.left = area.left.min(left);
-    area.top = area.top.min(top);
-    area.right = area.right.max(left + layout.size.width);
-    area.bottom = area.bottom.max(top + layout.size.height);
 }
 
 impl BaseDocument {
@@ -107,8 +90,11 @@ impl BaseDocument {
             };
             let is_fixed = is_fixed_positioned(node);
             if let Some(children) = node.layout_children.borrow().as_ref() {
-                let child_moves_with_ancestor =
-                    moves_with_ancestor || is_fixed || establishes_fixed_containing_block(node);
+                let child_moves_with_ancestor = moves_with_ancestor
+                    || is_fixed
+                    || node
+                        .primary_styles()
+                        .is_some_and(|style| establishes_fixed_containing_block(&style));
                 stack.extend(
                     children
                         .iter()
@@ -148,16 +134,11 @@ impl BaseDocument {
     /// scroll puts it, and never shrinks for one: a wider rect only prunes less. No ancestor
     /// up to the root has a transform, or the box would not be shifted.
     fn widen_ancestors_to(&mut self, id: NodeId) {
-        let layout = *self.nodes[id].final_layout();
         let mut current = id;
         while let Some(parent_id) = self.nodes[current].layout_parent.get() {
             let overflow = self.overflow_in_parent_frame(current);
-            let parent = &mut self.nodes[parent_id];
-            let stored = parent.scrollable_overflow_mut();
+            let stored = self.nodes[parent_id].scrollable_overflow_mut();
             *stored = stored.union(overflow);
-            if let Some(context) = &mut parent.stacking_context {
-                widen_content_area(context, id, &layout);
-            }
             current = parent_id;
         }
     }
@@ -174,7 +155,10 @@ impl BaseDocument {
                 break (taffy::Point::ZERO, viewport);
             };
             let candidate = &self.nodes[candidate_id];
-            if establishes_fixed_containing_block(candidate) {
+            if candidate
+                .primary_styles()
+                .is_some_and(|style| establishes_fixed_containing_block(&style))
+            {
                 let layout = candidate.unrounded_layout();
                 let origin = self.unrounded_origin(candidate_id);
                 break (
@@ -380,7 +364,7 @@ mod tests {
     }
 
     /// A non-zero `z-index` is reached through the stacking context's content area, which
-    /// the style flush computes before layout shifts the box.
+    /// `place_hoisted_children` computes after the shift.
     #[test]
     fn hit_test_reaches_a_hoisted_fixed_box_on_the_first_resolve_after_a_scroll() {
         let (mut doc, _, fixed) = layout("width:100px;height:100px", &format!("{FIXED};z-index:1"));
