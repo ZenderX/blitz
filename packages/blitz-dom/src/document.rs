@@ -1294,13 +1294,9 @@ impl BaseDocument {
         node
     }
 
-    pub(crate) fn resolve_url(&self, raw: &str) -> url::Url {
-        self.url.resolve_relative(raw).unwrap_or_else(|| {
-            panic!(
-                "to be able to resolve {raw} with the base_url: {:?}",
-                *self.url
-            )
-        })
+    /// `None` when `raw`, which is page-controlled, cannot be parsed against the base url.
+    pub(crate) fn resolve_url(&self, raw: &str) -> Option<url::Url> {
+        self.url.resolve_relative(raw)
     }
 
     pub fn print_tree(&self) {
@@ -1322,7 +1318,13 @@ impl BaseDocument {
                 if let Some(href) = element.attr(local_name!("href")) {
                     // println!("Node {node_id} {href} {href_to_reload} {} {}", resolved_href.as_str(), resolved_href.as_str() == url_to_reload);
                     if href == href_to_reload {
-                        let resolved_href = self.resolve_url(href);
+                        let Some(resolved_href) = self.resolve_url(href) else {
+                            #[cfg(feature = "tracing")]
+                            tracing::warn!(
+                                "Not reloading stylesheet: could not resolve url {href}"
+                            );
+                            continue;
+                        };
                         self.net_provider.fetch(
                             self.id(),
                             self.build_request(resolved_href.clone()),
@@ -3905,6 +3907,120 @@ mod changed_nodes_tests {
             1,
             "only the one live control may keep a form-owner entry"
         );
+    }
+}
+
+/// Under `panic = "abort"` a panic here takes the whole host down, and every
+/// one of these urls comes straight from page markup or script.
+#[cfg(test)]
+mod unresolvable_url_tests {
+    use super::*;
+    use crate::{Attribute, qual_name};
+
+    const BAD_URL: &str = "http://[";
+
+    fn new_doc() -> BaseDocument {
+        let mut doc = BaseDocument::new(DocumentConfig::default());
+        doc.set_base_url("http://example.com/");
+        doc
+    }
+
+    fn attr(name: markup5ever::QualName, value: &str) -> Attribute {
+        Attribute {
+            name,
+            value: value.to_string(),
+        }
+    }
+
+    /// Attaching to the document is what queues the element's resource load,
+    /// and dropping the mutator is what runs it.
+    fn attach(
+        doc: &mut BaseDocument,
+        name: markup5ever::QualName,
+        attrs: Vec<Attribute>,
+    ) -> NodeId {
+        let root_id = doc.root_node().id;
+        let mut mutator = doc.mutate();
+        let element = mutator.create_element(name, attrs);
+        mutator.append_children(root_id, &[element]);
+        drop(mutator);
+        element
+    }
+
+    fn stylesheet_link(doc: &mut BaseDocument, href: &str) -> NodeId {
+        attach(
+            doc,
+            qual_name!("link"),
+            vec![
+                attr(qual_name!("rel"), "stylesheet"),
+                attr(qual_name!("href"), href),
+            ],
+        )
+    }
+
+    #[test]
+    fn resolve_url_answers_none_only_for_an_unparsable_url() {
+        let doc = new_doc();
+        assert!(doc.resolve_url(BAD_URL).is_none());
+        assert_eq!(
+            doc.resolve_url("a.css").map(String::from).as_deref(),
+            Some("http://example.com/a.css"),
+            "a relative url must still resolve against the base"
+        );
+    }
+
+    #[test]
+    fn a_link_with_an_unparsable_href_does_not_abort_the_host() {
+        let mut doc = new_doc();
+        stylesheet_link(&mut doc, BAD_URL);
+    }
+
+    #[test]
+    fn rewriting_a_link_href_to_an_unparsable_url_does_not_abort_the_host() {
+        let mut doc = new_doc();
+        let link = stylesheet_link(&mut doc, "a.css");
+        let mut mutator = doc.mutate();
+        mutator.set_attribute(link, qual_name!("href"), BAD_URL);
+    }
+
+    /// `pending_images` is what a real fetch leaves behind, so the good `src`
+    /// proves the bad one was skipped at the loader rather than never reached.
+    #[test]
+    fn an_img_with_an_unparsable_src_is_skipped_and_a_good_one_still_loads() {
+        let mut doc = new_doc();
+        attach(
+            &mut doc,
+            qual_name!("img"),
+            vec![attr(qual_name!("src"), BAD_URL)],
+        );
+        assert!(doc.pending_images.is_empty());
+
+        attach(
+            &mut doc,
+            qual_name!("img"),
+            vec![attr(qual_name!("src"), "a.png")],
+        );
+        assert!(doc.pending_images.contains_key("http://example.com/a.png"));
+    }
+
+    #[test]
+    fn submitting_a_form_with_an_unparsable_action_does_not_abort_the_host() {
+        let mut doc = new_doc();
+        let form = attach(
+            &mut doc,
+            qual_name!("form"),
+            vec![attr(qual_name!("action"), BAD_URL)],
+        );
+        doc.submit_form(form, form);
+    }
+
+    #[test]
+    fn reloading_a_stylesheet_with_an_unparsable_href_does_not_abort_the_host() {
+        let mut doc = new_doc();
+        let link = stylesheet_link(&mut doc, BAD_URL);
+        let sheet = doc.make_stylesheet("", Origin::Author);
+        doc.add_stylesheet_for_node(sheet, link);
+        doc.reload_resource_by_href(BAD_URL);
     }
 }
 
