@@ -490,7 +490,20 @@ fn collect_layout_children_with_wrap(
                 return;
             } else if matches!(
                 type_attr,
-                None | Some("text" | "password" | "email" | "number" | "search" | "tel" | "url")
+                None | Some(
+                    "text"
+                        | "password"
+                        | "email"
+                        | "number"
+                        | "search"
+                        | "tel"
+                        | "url"
+                        | "date"
+                        | "time"
+                        | "month"
+                        | "week"
+                        | "datetime-local"
+                )
             ) {
                 create_text_editor(doc, container_node_id, false);
                 return;

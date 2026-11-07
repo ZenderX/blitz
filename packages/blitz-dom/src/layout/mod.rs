@@ -214,7 +214,11 @@ impl BaseDocument {
                                 },
                             );
                         }
-                        None | Some("text" | "password" | "email" | "tel" | "url" | "search") => {
+                        None
+                        | Some(
+                            "text" | "password" | "email" | "number" | "tel" | "url" | "search"
+                            | "date" | "time" | "month" | "week" | "datetime-local",
+                        ) => {
                             return compute_leaf_layout(
                                 inputs,
                                 node.style(),
