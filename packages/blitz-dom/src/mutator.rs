@@ -55,6 +55,7 @@ pub struct DocumentMutator<'doc> {
     title_node: Option<NodeId>,
     style_nodes: HashSet<NodeId>,
     form_nodes: HashSet<NodeId>,
+    textarea_nodes: HashSet<NodeId>,
 
     /// Whether an element/attribute that affect animation status has been seen
     recompute_is_animating: bool,
@@ -84,6 +85,7 @@ impl DocumentMutator<'_> {
             title_node: None,
             style_nodes: HashSet::new(),
             form_nodes: HashSet::new(),
+            textarea_nodes: HashSet::new(),
             recompute_is_animating: false,
             mutations_occurred: false,
             #[cfg(feature = "autofocus")]
@@ -197,7 +199,7 @@ impl DocumentMutator<'_> {
             if let Some(parent_id) = parent_id {
                 let parent = &mut self.doc.nodes[parent_id];
                 parent.insert_damage(ALL_DAMAGE);
-                self.doc.invalidate_flat_tree_for_child_change(parent_id);
+                self.doc.invalidate_flat_tree_for_text_change(parent_id);
             }
 
             self.maybe_record_node(parent_id);
@@ -219,7 +221,7 @@ impl DocumentMutator<'_> {
                 data.content += text;
                 self.mutations_occurred |= node_is_in_document;
                 if let Some(parent_id) = parent_id {
-                    self.doc.invalidate_flat_tree_for_child_change(parent_id);
+                    self.doc.invalidate_flat_tree_for_text_change(parent_id);
                 }
                 Ok(())
             }
@@ -459,6 +461,9 @@ impl DocumentMutator<'_> {
                     &mut self.doc.layout_ctx,
                     "",
                 );
+                if input_data.is_multiline {
+                    self.textarea_nodes.insert(node_id);
+                }
             }
         }
 
@@ -896,6 +901,10 @@ impl<'doc> DocumentMutator<'doc> {
             self.doc.reset_form_owner(id);
         }
 
+        for id in self.textarea_nodes.drain() {
+            sync_textarea_editor(self.doc, id);
+        }
+
         #[cfg(feature = "autofocus")]
         if let Some(node_id) = self.node_to_autofocus.take() {
             if self.doc.get_node(node_id).is_some() {
@@ -1072,6 +1081,9 @@ impl<'doc> DocumentMutator<'doc> {
             "title" => self.title_node = Some(node_id),
             "style" => {
                 self.style_nodes.insert(node_id);
+            }
+            "textarea" => {
+                self.textarea_nodes.insert(node_id);
             }
             _ => {}
         }
@@ -1296,6 +1308,29 @@ impl<'doc> DocumentMutator<'doc> {
 }
 
 /// Set 'checked' state on an input based on given attributevalue
+/// Show a `<textarea>`'s child text in its editor, unless a `value` attribute
+/// overrides it. A node with no editor yet is seeded when its box is constructed.
+fn sync_textarea_editor(doc: &mut BaseDocument, node_id: NodeId) {
+    // The textarea may have been dropped since it was recorded.
+    let Some(node) = doc.nodes.get_mut(node_id) else {
+        return;
+    };
+    if node.attr(local_name!("value")).is_some() {
+        return;
+    }
+    let text = node.text_content();
+    if let Some(input_data) = node
+        .element_data_mut()
+        .and_then(|element| element.text_input_data_mut())
+    {
+        input_data.set_text(
+            &mut doc.font_ctx.lock().unwrap(),
+            &mut doc.layout_ctx,
+            &text,
+        );
+    }
+}
+
 fn set_input_checked_state(element: &mut ElementData, value: String) {
     let Ok(checked) = value.parse() else {
         return;

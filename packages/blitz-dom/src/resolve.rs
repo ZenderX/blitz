@@ -203,12 +203,12 @@ impl BaseDocument {
             .map(|d| d.contains(style::selector_parser::RestyleDamage::RECALCULATE_OVERFLOW))
             .unwrap_or(false)
         {
-            return *self.nodes[node_id].scrollable_overflow();
+            return self.overflow_in_parent_frame(node_id);
         }
 
         let scale = self.viewport.scale_f64();
 
-        let transform = self.nodes[node_id].set_transform(scale as f32);
+        self.nodes[node_id].set_transform(scale as f32);
 
         let w = self.nodes[node_id].final_layout().size.width as f64 * scale;
         let h = self.nodes[node_id].final_layout().size.height as f64 * scale;
@@ -234,16 +234,20 @@ impl BaseDocument {
         *self.nodes[node_id].scrollable_overflow_mut() = overflow;
         *self.nodes[node_id].layout_children.get_mut() = layout_children;
 
-        let scaled_x = self.nodes[node_id].final_layout().location.x as f64 * scale;
-        let scaled_y = self.nodes[node_id].final_layout().location.y as f64 * scale;
+        self.overflow_in_parent_frame(node_id)
+    }
 
-        let full = if let Some(t) = transform {
-            Affine::translate((scaled_x, scaled_y)) * t
-        } else {
-            Affine::translate((scaled_x, scaled_y))
+    /// The node's stored overflow, which is in its own frame, in its layout parent's.
+    fn overflow_in_parent_frame(&self, node_id: NodeId) -> Rect {
+        let scale = self.viewport.scale_f64();
+        let node = &self.nodes[node_id];
+        let location = node.final_layout().location;
+        let translate = Affine::translate((location.x as f64 * scale, location.y as f64 * scale));
+        let full = match *node.transform() {
+            Some(t) => translate * t,
+            None => translate,
         };
-
-        full.transform_rect_bbox(overflow)
+        full.transform_rect_bbox(*node.scrollable_overflow())
     }
 
     /// Ensure that the layout_children field is populated for all nodes
@@ -470,5 +474,64 @@ impl BaseDocument {
             self.nodes[node_id].set_restyle_hint(RestyleHint::RESTYLE_DESCENDANTS);
         }
         !resized.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Attribute, DocumentConfig};
+    use kurbo::Point;
+    use markup5ever::{LocalName, QualName, ns};
+
+    fn name(local: &str) -> QualName {
+        QualName::new(None, ns!(html), LocalName::from(local))
+    }
+
+    fn block(doc: &mut BaseDocument, style: &str) -> NodeId {
+        let attrs = vec![Attribute {
+            name: name("style"),
+            value: format!("display:block;{style}"),
+        }];
+        doc.mutate().create_element(name("div"), attrs)
+    }
+
+    /// An attribute write damages only its node and that node's ancestors, so the
+    /// parent recomputes its overflow from a sibling that kept its old one. A parent
+    /// that lost the sibling's real position prunes it from every later hit test.
+    #[test]
+    fn a_write_beside_an_out_of_box_sibling_keeps_it_in_the_parent_overflow() {
+        const SIBLING: &str = "position:absolute;left:200px;top:300px;width:40px;height:40px;";
+        for (extra, inside) in [
+            ("", Point::new(220.0, 320.0)),
+            ("transform:translateX(100px);", Point::new(320.0, 320.0)),
+        ] {
+            let mut doc = BaseDocument::new(DocumentConfig::default());
+            let html = block(&mut doc, "");
+            let body = block(&mut doc, "");
+            let parent = block(&mut doc, "");
+            let written = block(&mut doc, "height:10px;");
+            let sibling = block(&mut doc, &format!("{SIBLING}{extra}"));
+            {
+                let mut m = doc.mutate();
+                let root = m.doc.root_node().id;
+                m.append_children(root, &[html]);
+                m.append_children(html, &[body]);
+                m.append_children(body, &[parent]);
+                m.append_children(parent, &[written, sibling]);
+            }
+            doc.resolve(0.0);
+            let before = *doc.nodes[parent].scrollable_overflow();
+            assert!(before.contains(inside), "{extra:?}: {before:?}");
+
+            doc.mutate().set_attribute(written, name("value"), "x");
+            doc.resolve(0.0);
+
+            assert_eq!(
+                *doc.nodes[parent].scrollable_overflow(),
+                before,
+                "{extra:?}: the write moves nothing"
+            );
+        }
     }
 }

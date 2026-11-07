@@ -867,12 +867,18 @@ fn collect_complex_layout_children(
 fn create_text_editor(doc: &mut BaseDocument, input_element_id: NodeId, is_multiline: bool) {
     let node = &mut doc.nodes[input_element_id];
     let control_text_styles = stylo_to_parley::control_text_styles(node);
+    let child_text = if is_multiline {
+        node.text_content()
+    } else {
+        String::new()
+    };
 
     let element = &mut node.data.downcast_element_mut().unwrap();
     if !matches!(element.special_data, SpecialElementData::TextInput(_)) {
         let mut text_input_data = TextInputData::new(is_multiline);
         let editor = &mut text_input_data.editor;
-        editor.set_text(element.attr(local_name!("value")).unwrap_or(""));
+        // A `<textarea>` shows its child text until a `value` attribute overrides it.
+        editor.set_text(element.attr(local_name!("value")).unwrap_or(&child_text));
         element.special_data = SpecialElementData::TextInput(text_input_data);
     }
 
