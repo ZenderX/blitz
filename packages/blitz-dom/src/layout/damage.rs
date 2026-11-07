@@ -13,14 +13,15 @@ use style::properties::generated::longhands::position::computed_value::T as Posi
 use style::selector_parser::RestyleDamage;
 use style::url::ComputedUrl;
 use style::values::computed::Float;
+use style::values::computed::basic_shape::ClipPath;
 use style::values::computed::image::Image as ComputedImage;
+use style::values::computed::{Overflow, Perspective, Rotate};
 use style::values::generics::basic_shape::ShapeOutside;
 use style::values::generics::image::Image as StyloImage;
+use style::values::generics::transform::{Scale, Translate};
 use style::values::specified::align::AlignFlags;
-use style::values::specified::box_::DisplayInside;
-use style::values::specified::box_::DisplayOutside;
+use style::values::specified::box_::{Contain, DisplayInside, DisplayOutside, WillChangeBits};
 use taffy::Rect;
-use thin_vec::ThinVec;
 
 pub(crate) const CONSTRUCT_BOX: RestyleDamage =
     RestyleDamage::from_bits_retain(0b_0000_0000_0001_0000);
@@ -338,11 +339,12 @@ impl HoistedPaintChildren {
 
     pub fn compute_content_size(&mut self, doc: &BaseDocument) {
         fn child_pos(child: &HoistedPaintChild, doc: &BaseDocument) -> Rect<f32> {
-            let node = &doc.nodes[child.node_id];
-            let left = child.position.x + node.final_layout().location.x;
-            let top = child.position.y + node.final_layout().location.y;
-            let right = left + node.final_layout().size.width;
-            let bottom = top + node.final_layout().size.height;
+            let layout = doc.nodes[child.node_id].final_layout();
+            let left = child.position.x + layout.location.x;
+            let top = child.position.y + layout.location.y;
+            let overflow = layout.scrollable_overflow_rect;
+            let right = left + layout.size.width.max(overflow.right);
+            let bottom = top + layout.size.height.max(overflow.bottom);
 
             taffy::Rect {
                 top,
@@ -432,7 +434,72 @@ impl BaseDocument {
     }
 
     pub fn flush_styles_to_layout(&mut self, node_id: NodeId) {
-        self.flush_styles_to_layout_impl(node_id, None, LayoutFlow::HorizontalTb);
+        self.flush_styles_to_layout_impl(node_id, None, LayoutFlow::HorizontalTb, &mut false, true);
+    }
+
+    /// Set the position and content area of every hoisted child from the finished layout.
+    /// The hoisting itself runs in the style flush, before that layout is known.
+    pub(crate) fn place_hoisted_children(&mut self) {
+        let mut stack = vec![self.root_element().id];
+        while let Some(id) = stack.pop() {
+            if let Some(children) = self.nodes[id].layout_children.borrow().as_ref() {
+                stack.extend(children.iter().copied());
+            }
+            let Some(mut context) = self.nodes[id].stacking_context.take() else {
+                continue;
+            };
+            for child in &mut context.children {
+                child.position = self.offset_from_stacking_context(child.node_id, id);
+            }
+            context.compute_content_size(self);
+            self.nodes[id].stacking_context = Some(context);
+        }
+    }
+
+    /// The origin of `id`'s layout parent in the frame the stacking context `root` paints its
+    /// children in.
+    fn offset_from_stacking_context(&self, id: NodeId, root: NodeId) -> taffy::Point<f32> {
+        let mut offset = taffy::Point::ZERO;
+        let mut ancestor = self.nodes[id].layout_parent.get();
+        while let Some(id) = ancestor.filter(|&id| id != root) {
+            let node = &self.nodes[id];
+            let location = node.final_layout().location;
+            let scroll_offset = node.scroll_offset();
+            offset.x += location.x - scroll_offset.x as f32;
+            offset.y += location.y - scroll_offset.y as f32;
+            ancestor = node.layout_parent.get();
+        }
+        offset
+    }
+
+    /// The `z-index` to hoist `child_id` to its stacking context with, or `None` to paint it
+    /// with its parent. A non-zero `z-index` is hoisted. A fixed box of `z-index` auto or 0
+    /// is too, as it paints above in-flow content even where its parent would paint below a
+    /// later sibling; then so is every positioned box after it, which paints above it (CSS
+    /// 2.1 Appendix E step 8).
+    fn hoisted_z_index(
+        &self,
+        child_id: NodeId,
+        is_flex_or_grid: bool,
+        can_hoist_auto_z: bool,
+        follows_fixed_box: bool,
+    ) -> Option<i32> {
+        let child = &self.nodes[child_id];
+        let style = child.primary_styles()?;
+        let position = style.clone_position();
+        let z_index = style.clone_z_index().integer_or(0);
+        if z_index != 0 {
+            // z-index applies to static flex/grid items too
+            // (css-flexbox-1 §painting, css-grid-1 §z-order).
+            return (position != Position::Static || is_flex_or_grid).then_some(z_index);
+        }
+        let is_at_fixed_box_level = match position {
+            Position::Fixed => true,
+            Position::Relative | Position::Absolute | Position::Sticky => follows_fixed_box,
+            Position::Static => false,
+        };
+        (is_at_fixed_box_level && can_hoist_auto_z && child.style().display != taffy::Display::None)
+            .then_some(0)
     }
 
     /// Flush the image layers of nodes whose style changed during the last
@@ -556,6 +623,8 @@ impl BaseDocument {
         node_id: NodeId,
         parent_stacking_context: Option<&mut HoistedPaintChildren>,
         parent_flow: LayoutFlow,
+        fixed_box_seen: &mut bool,
+        can_hoist_auto_z: bool,
     ) {
         let mut new_stacking_context: HoistedPaintChildren = HoistedPaintChildren::new();
         let stacking_context = &mut new_stacking_context;
@@ -629,18 +698,6 @@ impl BaseDocument {
         if let Some(mut children) = children {
             let is_flex_or_grid = matches!(display, taffy::Display::Flex | taffy::Display::Grid);
 
-            // Recursively call flush_styles_to_layout on each child
-            for &child in children.iter() {
-                self.flush_styles_to_layout_impl(
-                    child,
-                    match self.nodes[child].is_stacking_context_root(is_flex_or_grid) {
-                        true => None,
-                        false => Some(stacking_context),
-                    },
-                    flow,
-                );
-            }
-
             // Sort layout_children
             if is_flex_or_grid {
                 children.sort_by(|left, right| {
@@ -650,38 +707,60 @@ impl BaseDocument {
                 });
             }
 
+            let children_can_hoist_auto_z = parent_stacking_context.is_none()
+                || (can_hoist_auto_z
+                    && !self.nodes[node_id]
+                        .primary_styles()
+                        .is_some_and(|style| confines_descendants(&style)));
+
             // Reserve space for paint_children
-            let mut paint_children = self.nodes[node_id].paint_children.borrow_mut();
-            if paint_children.is_none() {
-                *paint_children = Some(ThinVec::new());
-            }
-            let paint_children = paint_children.as_mut().unwrap();
+            let mut paint_children = self.nodes[node_id]
+                .paint_children
+                .borrow_mut()
+                .take()
+                .unwrap_or_default();
             paint_children.clear();
             paint_children.reserve(children.len());
 
-            // Push children to either paint_children or layout_children depending on
+            // Recursively call flush_styles_to_layout on each child, and push it to either
+            // paint_children or the stacking context. A hoisted child goes before what its
+            // descendants hoisted, so that a stacking context's children stay in tree order.
             for &child_id in children.iter() {
-                let child = &self.nodes[child_id];
+                let first_hoisted_below = stacking_context.children.len();
+                let follows_fixed_box = *fixed_box_seen;
 
-                let Some(style) = child.primary_styles() else {
-                    paint_children.push(child_id);
-                    continue;
-                };
-
-                let position = style.clone_position();
-                let z_index = style.clone_z_index().integer_or(0);
+                if self.nodes[child_id].is_stacking_context_root(is_flex_or_grid) {
+                    self.flush_styles_to_layout_impl(child_id, None, flow, &mut false, true);
+                } else {
+                    self.flush_styles_to_layout_impl(
+                        child_id,
+                        Some(stacking_context),
+                        flow,
+                        fixed_box_seen,
+                        children_can_hoist_auto_z,
+                    );
+                }
 
                 // TODO: more complete hoisting detection
-                // z-index applies to static flex/grid items too
-                // (css-flexbox-1 §painting, css-grid-1 §z-order).
-                if z_index != 0 && (position != Position::Static || is_flex_or_grid) {
-                    stacking_context.children.push(HoistedPaintChild {
-                        node_id: child_id,
-                        z_index,
-                        position: taffy::Point::ZERO,
-                    })
-                } else {
-                    paint_children.push(child_id);
+                match self.hoisted_z_index(
+                    child_id,
+                    is_flex_or_grid,
+                    children_can_hoist_auto_z,
+                    follows_fixed_box,
+                ) {
+                    Some(z_index) => {
+                        // A box at z-index 0 is here as the fixed box, or after one.
+                        *fixed_box_seen |= z_index == 0;
+                        stacking_context.children.insert(
+                            first_hoisted_below,
+                            HoistedPaintChild {
+                                node_id: child_id,
+                                z_index,
+                                position: taffy::Point::ZERO,
+                            },
+                        );
+                    }
+                    None => paint_children.push(child_id),
                 }
             }
 
@@ -694,25 +773,55 @@ impl BaseDocument {
             });
 
             // Put children back
+            *self.nodes[node_id].paint_children.borrow_mut() = Some(paint_children);
             *self.nodes[node_id].layout_children.borrow_mut() = Some(children);
         }
 
         if let Some(parent_stacking_context) = parent_stacking_context {
-            let position = self.nodes[node_id].final_layout().location;
-            let scroll_offset = *self.nodes[node_id].scroll_offset();
-            for hoisted in stacking_context.children.iter_mut() {
-                hoisted.position.x += position.x - scroll_offset.x as f32;
-                hoisted.position.y += position.y - scroll_offset.y as f32;
-            }
             parent_stacking_context
                 .children
                 .extend(stacking_context.children.iter().cloned());
+            // A box that stopped being a stacking context would paint its old list twice.
+            self.nodes[node_id].stacking_context = None;
         } else {
             stacking_context.sort();
-            stacking_context.compute_content_size(self);
             self.nodes[node_id].stacking_context = Some(Box::new(new_stacking_context));
         }
     }
+}
+
+/// Whether a box holds its descendants in a clip, a group effect or a containing block for
+/// fixed boxes, which a box of `z-index` auto hoisted past it would escape. Some of these are
+/// stacking contexts by spec, but `is_stacking_context_root` knows only some of them, and a
+/// `transform` only from the second flush.
+fn confines_descendants(style: &ComputedValues) -> bool {
+    let box_style = style.get_box();
+    let effects = style.get_effects();
+    !matches!(box_style.overflow_x, Overflow::Visible)
+        || !matches!(box_style.overflow_y, Overflow::Visible)
+        || box_style
+            .contain
+            .intersects(Contain::LAYOUT | Contain::PAINT)
+        || !box_style.transform.0.is_empty()
+        || !matches!(box_style.translate, Translate::None)
+        || !matches!(box_style.rotate, Rotate::None)
+        || !matches!(box_style.scale, Scale::None)
+        || !matches!(box_style.perspective, Perspective::None)
+        || box_style.will_change.bits.intersects(
+            WillChangeBits::TRANSFORM
+                | WillChangeBits::PERSPECTIVE
+                | WillChangeBits::CONTAIN
+                | WillChangeBits::FIXPOS_CB_NON_SVG,
+        )
+        || !effects.filter.0.is_empty()
+        || !effects.backdrop_filter.0.is_empty()
+        || !matches!(style.clone_clip_path(), ClipPath::None)
+        || style
+            .get_svg()
+            .mask_image
+            .0
+            .iter()
+            .any(|image| !matches!(image, StyloImage::None))
 }
 
 #[inline(always)]

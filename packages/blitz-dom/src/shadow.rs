@@ -429,9 +429,10 @@ impl BaseDocument {
         host_node.mark_ancestors_dirty();
     }
 
-    /// Call after a text node directly below `parent` changed, to refresh the
-    /// flat tree where that matters: below a shadow root, below a shadow host,
-    /// and below a `<slot>`'s fallback content.
+    /// Call after a text node directly below `parent` or the `slot` attribute of
+    /// a child of `parent` changed, to refresh the flat tree where that matters:
+    /// below a shadow root, below a shadow host, and below a `<slot>`'s fallback
+    /// content.
     pub(crate) fn invalidate_flat_tree_for_text_change(&mut self, parent: NodeId) {
         let host = self.get_node(parent).and_then(Node::host_of_flat_children);
         if let Some(host) = host {
@@ -465,7 +466,8 @@ impl BaseDocument {
         };
         if &**attr == "slot" {
             if let Some(parent) = node_ref.parent {
-                self.invalidate_flat_tree_for_child_change(parent);
+                // Only a host's child is slottable: this moves no `<slot>`.
+                self.invalidate_flat_tree_for_text_change(parent);
             }
         } else if *attr == local_name!("name") && node_ref.is_slot_element() {
             self.invalidate_flat_tree_for_child_change(node);
@@ -845,6 +847,48 @@ mod tests {
         assert!(is_unhinted, "a text edit must not restyle the whole host");
     }
 
+    /// Only a host's child can be assigned to a slot, so `slot` on a child deeper
+    /// in the shadow tree moves nothing and must not cost a restyle of the host.
+    #[test]
+    fn a_slot_attribute_under_a_plain_element_leaves_the_host_undamaged() {
+        let mut f = Fixture::new();
+        let (host, div, _light) = host_with_plain_child(&mut f);
+        let slot = f.element("slot", &[]);
+        let child = f.element("p", &[]);
+        f.append(div, &[slot, child]);
+        f.doc.resolve(0.0);
+
+        f.doc.mutate().set_attribute(child, el("slot"), "a");
+        let is_undamaged = f.doc.nodes[host].damage().is_some_and(|d| d.is_empty());
+        assert!(is_undamaged, "the write reassigned nothing in the host");
+        let is_unhinted = f.doc.nodes[host]
+            .stylo_element_data_opt_mut()
+            .and_then(|s| s.get_mut())
+            .is_some_and(|data| data.hint.is_empty());
+        assert!(is_unhinted, "the write must not restyle the whole host");
+    }
+
+    /// The child a `slot` write can move still has to reach the box of the wrapper
+    /// holding its slot, both on the way in and on the way out.
+    #[test]
+    fn a_slot_attribute_on_a_hosts_child_reslots_under_a_plain_element() {
+        let mut f = Fixture::new();
+        let (host, div, light) = host_with_plain_child(&mut f);
+        let slot = f.element("slot", &[("name", "a")]);
+        f.append(div, &[slot]);
+        assert_eq!(f.layout_children(div), Vec::<NodeId>::new());
+
+        f.doc.mutate().set_attribute(light, el("slot"), "a");
+        assert_eq!(f.doc.assigned_slot(light), Some(slot));
+        assert_eq!(f.layout_children(div), vec![light]);
+        assert_eq!(height(&f, host), 30.0);
+
+        f.doc.mutate().set_attribute(light, el("slot"), "zz");
+        assert_eq!(f.doc.assigned_slot(light), None);
+        assert_eq!(f.layout_children(div), Vec::<NodeId>::new());
+        assert_eq!(height(&f, host), 0.0);
+    }
+
     #[test]
     fn style_inherits_through_the_flat_tree() {
         let mut f = Fixture::new();
@@ -1140,5 +1184,86 @@ mod tests {
         f.doc.set_adopted_stylesheets(None, &[]);
         f.doc.resolve(0.0);
         assert_eq!(height(&f, host), 70.0);
+    }
+
+    /// Node counts of the recorded `flush_layout` baseline, each with 5% of its
+    /// cost in µs (1.4 ms at 811 nodes, 4.3 ms at 2211).
+    const SLOT_WALK_BARS: [(usize, f64); 2] = [(811, 70.0), (2211, 215.0)];
+    const SLOT_WALK_BRANCH_DEPTH: usize = 16;
+    const SLOT_WALK_SAMPLES: usize = 501;
+
+    /// A shadowless document of exactly `node_count` nodes, in branches of
+    /// nested elements with as many leaves again under the deepest one.
+    fn light_tree(node_count: usize) -> Fixture {
+        let mut f = Fixture::new();
+        let mut parent = f.body;
+        let mut placed = 0;
+        while f.doc.nodes.len() < node_count {
+            let div = f.element("div", &[]);
+            f.append(parent, &[div]);
+            placed += 1;
+            if placed < SLOT_WALK_BRANCH_DEPTH {
+                parent = div;
+            } else if placed == 2 * SLOT_WALK_BRANCH_DEPTH {
+                parent = f.body;
+                placed = 0;
+            }
+        }
+        f
+    }
+
+    fn sweep_children(doc: &mut BaseDocument, node_id: NodeId) -> usize {
+        let mut visited = 1;
+        doc.iter_children_mut(node_id, |child_id, doc| {
+            visited += sweep_children(doc, child_id);
+        });
+        visited
+    }
+
+    fn median_and_max_micros(mut run: impl FnMut()) -> (f64, f64) {
+        let mut samples: Vec<f64> = (0..SLOT_WALK_SAMPLES)
+            .map(|_| {
+                let start = std::time::Instant::now();
+                run();
+                start.elapsed().as_secs_f64() * 1e6
+            })
+            .collect();
+        samples.sort_by(f64::total_cmp);
+        (
+            samples[SLOT_WALK_SAMPLES / 2],
+            samples[SLOT_WALK_SAMPLES - 1],
+        )
+    }
+
+    #[test]
+    #[ignore = "timing harness: read its output with --nocapture, it has no pass bar"]
+    fn slot_walk_cost_on_light_trees() {
+        for (node_count, bar_micros) in SLOT_WALK_BARS {
+            let mut f = light_tree(node_count);
+            let root = f.doc.root_node().id;
+            let ids: Vec<NodeId> = f.doc.nodes.iter().map(|(id, _)| id).collect();
+            let depth_sum: usize = ids
+                .iter()
+                .map(|&id| {
+                    std::iter::successors(f.doc.nodes[id].parent, |&p| f.doc.nodes[p].parent)
+                        .count()
+                })
+                .sum();
+            let mean_depth = depth_sum as f64 / node_count as f64;
+
+            let (sweep_median, sweep_max) = median_and_max_micros(|| {
+                assert_eq!(sweep_children(&mut f.doc, root), node_count);
+            });
+            let (walk_median, walk_max) = median_and_max_micros(|| {
+                for &id in &ids {
+                    std::hint::black_box(f.doc.nodes[id].is_in_shadow_tree());
+                }
+            });
+            println!(
+                "slot_walk: {node_count} nodes, mean depth {mean_depth:.1}, bar {bar_micros} us: \
+                 sweep median {sweep_median:.1} us, max {sweep_max:.1} us; \
+                 walk alone median {walk_median:.1} us, max {walk_max:.1} us"
+            );
+        }
     }
 }

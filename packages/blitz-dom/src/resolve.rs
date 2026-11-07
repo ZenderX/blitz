@@ -238,7 +238,7 @@ impl BaseDocument {
     }
 
     /// The node's stored overflow, which is in its own frame, in its layout parent's.
-    fn overflow_in_parent_frame(&self, node_id: NodeId) -> Rect {
+    pub(crate) fn overflow_in_parent_frame(&self, node_id: NodeId) -> Rect {
         let scale = self.viewport.scale_f64();
         let node = &self.nodes[node_id];
         let location = node.final_layout().location;
@@ -409,6 +409,7 @@ impl BaseDocument {
     /// TODO: update taffy to use an associated type instead of slab key
     /// TODO: update taffy to support traited styles so we don't even need to rely on taffy for storage
     pub fn resolve_layout(&mut self) {
+        let sizes_before = self.box_sizes();
         let size = self.stylist.device().au_viewport_size();
 
         let available_space = taffy::Size {
@@ -421,13 +422,53 @@ impl BaseDocument {
         // println!("\n\nRESOLVE LAYOUT\n===========\n");
 
         taffy::compute_root_layout(self, root_element_id, available_space);
-        self.layout_fixed_boxes();
+        let scrolled_fixed_boxes = self.layout_fixed_boxes();
         taffy::round_layout(self, root_element_id);
         self.map_vertical_layouts(self.root_element().id);
+        self.scroll_fixed_boxes(&scrolled_fixed_boxes);
         self.layout_sticky_boxes();
+        self.place_hoisted_children();
+        self.damage_overflow_of_resized_boxes(&sizes_before);
 
         // println!("\n\n");
         // taffy::print_tree(self, root_node_id)
+    }
+
+    /// The size of every box, for `damage_overflow_of_resized_boxes` to compare against.
+    /// Without incremental layout nothing reads overflow damage, so it records none.
+    fn box_sizes(&self) -> Vec<(NodeId, taffy::Size<f32>)> {
+        if !self.incremental_layout {
+            return Vec::new();
+        }
+        self.nodes
+            .iter()
+            .filter_map(|(id, node)| Some((id, node.element_data()?.final_layout.size)))
+            .collect()
+    }
+
+    /// A box resized by layout alone carries no damage of its own (a percentage width
+    /// under a written parent, any box under a resized window), yet its stored overflow
+    /// rect was computed from its old size. Damage it and its layout ancestors, so that
+    /// `resolve_transforms` reaches it.
+    fn damage_overflow_of_resized_boxes(&mut self, sizes_before: &[(NodeId, taffy::Size<f32>)]) {
+        for &(node_id, size_before) in sizes_before {
+            if self.nodes[node_id].final_layout().size == size_before {
+                continue;
+            }
+            let mut current = Some(node_id);
+            while let Some(id) = current {
+                let node = &mut self.nodes[id];
+                // Damage propagation already gave this overflow damage to every ancestor
+                if node
+                    .damage()
+                    .is_some_and(|d| d.contains(RestyleDamage::RECALCULATE_OVERFLOW))
+                {
+                    break;
+                }
+                node.insert_damage(RestyleDamage::RECALCULATE_OVERFLOW);
+                current = node.layout_parent.get();
+            }
+        }
     }
 
     /// Restyle the descendants of every size container whose contained axes changed since
@@ -532,6 +573,98 @@ mod tests {
                 before,
                 "{extra:?}: the write moves nothing"
             );
+        }
+    }
+
+    const OUT_OF_BOX_GRANDCHILDREN: [&str; 2] = [
+        "position:absolute;left:-30px;top:0;width:10px;height:10px;",
+        "position:absolute;right:-30px;top:0;width:10px;height:10px;",
+    ];
+
+    /// A parent, its percentage-width child and an out-of-box grandchild, resolved once.
+    fn resolved_boxes(
+        window_width: u32,
+        parent_style: &str,
+        grandchild_style: &str,
+    ) -> (BaseDocument, NodeId, NodeId) {
+        let mut doc = BaseDocument::new(DocumentConfig::default());
+        doc.viewport_mut().window_size = (window_width, 600);
+        let html = block(&mut doc, "");
+        let body = block(&mut doc, "");
+        let parent = block(&mut doc, parent_style);
+        let child = block(&mut doc, "position:relative;width:150%;height:10px;");
+        let grandchild = block(&mut doc, grandchild_style);
+        {
+            let mut m = doc.mutate();
+            let root = m.doc.root_node().id;
+            m.append_children(root, &[html]);
+            m.append_children(html, &[body]);
+            m.append_children(body, &[parent]);
+            m.append_children(parent, &[child]);
+            m.append_children(child, &[grandchild]);
+        }
+        doc.resolve(0.0);
+        (doc, parent, child)
+    }
+
+    /// The stored rects feed paint culling and hit-test pruning, so an incremental
+    /// resolve has to leave what a full one would.
+    fn assert_overflow_matches_a_full_resolve(
+        incremental: (&BaseDocument, NodeId, NodeId),
+        full: (&BaseDocument, NodeId, NodeId),
+        case: &str,
+    ) {
+        assert_eq!(
+            *incremental.0.nodes[incremental.2].scrollable_overflow(),
+            *full.0.nodes[full.2].scrollable_overflow(),
+            "child, {case}"
+        );
+        assert_eq!(
+            *incremental.0.nodes[incremental.1].scrollable_overflow(),
+            *full.0.nodes[full.1].scrollable_overflow(),
+            "parent, {case}"
+        );
+    }
+
+    /// Writing the parent's width damages neither the child it resizes nor the grandchild.
+    #[test]
+    fn an_undamaged_child_resized_by_its_parent_recomputes_its_overflow() {
+        for grandchild in OUT_OF_BOX_GRANDCHILDREN {
+            for (from, to) in [
+                ("width:100px;", "width:200px;"),
+                ("width:200px;", "width:100px;"),
+            ] {
+                let (mut doc, parent, child) = resolved_boxes(800, from, grandchild);
+                doc.mutate()
+                    .set_attribute(parent, name("style"), &format!("display:block;{to}"));
+                doc.resolve(0.0);
+
+                let (full, full_parent, full_child) = resolved_boxes(800, to, grandchild);
+                assert_overflow_matches_a_full_resolve(
+                    (&doc, parent, child),
+                    (&full, full_parent, full_child),
+                    &format!("{grandchild} {from} -> {to}"),
+                );
+            }
+        }
+    }
+
+    /// A window resize changes no computed percentage, so it damages nothing at all.
+    #[test]
+    fn a_window_resize_recomputes_the_overflow_of_undamaged_boxes() {
+        for grandchild in OUT_OF_BOX_GRANDCHILDREN {
+            for (from, to) in [(400, 800), (800, 400)] {
+                let (mut doc, parent, child) = resolved_boxes(from, "width:50%;", grandchild);
+                doc.viewport_mut().window_size = (to, 600);
+                doc.resolve(0.0);
+
+                let (full, full_parent, full_child) = resolved_boxes(to, "width:50%;", grandchild);
+                assert_overflow_matches_a_full_resolve(
+                    (&doc, parent, child),
+                    (&full, full_parent, full_child),
+                    &format!("{grandchild} {from} -> {to}"),
+                );
+            }
         }
     }
 }

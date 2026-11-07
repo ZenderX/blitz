@@ -7,9 +7,16 @@
 //! out every fixed box against its real containing block. The box stays in its layout
 //! parent's frame, so painting and hit-testing read the corrected rects unchanged.
 //!
-//! Scroll-independence is not implemented: a fixed box still moves with the scroll offset
-//! of its ancestors.
+//! A fixed box whose containing block is the viewport does not move with viewport scroll.
+//! As for sticky boxes (see `sticky.rs`), a pass after rounding adds the scroll to its
+//! `final_layout` location, and a scroll, which sets no damage, is picked up by the next
+//! `resolve`. The box then lies outside what its ancestors stored for hit-testing to prune
+//! on, so the pass widens that too.
+//!
+//! Only the viewport's scroll is cancelled: a fixed box still moves with the scroll offset
+//! of an ancestor scroll container, and with an ancestor's sticky shift.
 
+use crate::layout::damage::HoistedPaintChildren;
 use crate::layout::inline::layout_abspos_child;
 use crate::node::Node;
 use crate::{BaseDocument, NodeId};
@@ -48,6 +55,21 @@ fn is_fixed_positioned(node: &Node) -> bool {
         .is_some_and(|style| matches!(style.clone_position(), Position::Fixed))
 }
 
+/// Grow a stacking context's content area, which was computed before this layout, to cover
+/// the box `id` if it is hoisted there.
+fn widen_content_area(context: &mut HoistedPaintChildren, id: NodeId, layout: &taffy::Layout) {
+    let Some(child) = context.children.iter().find(|child| child.node_id == id) else {
+        return;
+    };
+    let left = child.position.x + layout.location.x;
+    let top = child.position.y + layout.location.y;
+    let area = &mut context.content_area;
+    area.left = area.left.min(left);
+    area.top = area.top.min(top);
+    area.right = area.right.max(left + layout.size.width);
+    area.bottom = area.bottom.max(top + layout.size.height);
+}
+
 impl BaseDocument {
     /// Document-space origin of a node's border box, from the unrounded layout.
     fn unrounded_origin(&self, id: NodeId) -> taffy::Point<f32> {
@@ -65,7 +87,10 @@ impl BaseDocument {
     /// Re-lay out every `position: fixed` box against its containing block. Runs between
     /// the taffy layout and rounding. Idempotent: the static position of an axis without
     /// insets is recovered from the box's current location, which is also the output.
-    pub(crate) fn layout_fixed_boxes(&mut self) {
+    /// Returns the boxes for [`Self::scroll_fixed_boxes`] to shift: those with no fixed
+    /// box or containing block for fixed boxes among their ancestors, which any other box
+    /// moves with.
+    pub(crate) fn layout_fixed_boxes(&mut self) -> Vec<NodeId> {
         let viewport = self.stylist.device().au_viewport_size();
         let viewport = taffy::Size {
             width: viewport.width.to_f32_px(),
@@ -74,21 +99,66 @@ impl BaseDocument {
 
         // Pre-order, so a fixed box nested in another is placed after its ancestor.
         let mut fixed_boxes = Vec::new();
-        let mut stack = vec![self.root_element().id];
-        while let Some(id) = stack.pop() {
+        let mut scrolled_boxes = Vec::new();
+        let mut stack = vec![(self.root_element().id, false)];
+        while let Some((id, moves_with_ancestor)) = stack.pop() {
             let Some(node) = self.nodes.get(id) else {
                 continue;
             };
+            let is_fixed = is_fixed_positioned(node);
             if let Some(children) = node.layout_children.borrow().as_ref() {
-                stack.extend(children.iter().rev().copied());
+                let child_moves_with_ancestor =
+                    moves_with_ancestor || is_fixed || establishes_fixed_containing_block(node);
+                stack.extend(
+                    children
+                        .iter()
+                        .rev()
+                        .map(|&child| (child, child_moves_with_ancestor)),
+                );
             }
-            if is_fixed_positioned(node) {
+            if is_fixed {
                 fixed_boxes.push(id);
+                if !moves_with_ancestor {
+                    scrolled_boxes.push(id);
+                }
             }
         }
 
         for id in fixed_boxes {
             self.layout_fixed_box(id, viewport);
+        }
+        scrolled_boxes
+    }
+
+    /// Add the viewport's scroll to each of `boxes`. Runs after rounding, so each box starts
+    /// from its unscrolled position, and before the sticky pass, so a sticky box inside one
+    /// measures from where it is.
+    pub(crate) fn scroll_fixed_boxes(&mut self, boxes: &[NodeId]) {
+        let scroll = self.viewport_scroll();
+        for &id in boxes {
+            let location = &mut self.nodes[id].final_layout_mut().location;
+            location.x += scroll.x as f32;
+            location.y += scroll.y as f32;
+            self.widen_ancestors_to(id);
+        }
+    }
+
+    /// Hit-testing prunes a subtree on what its root stored, and no damage recomputes that
+    /// for a scroll. So each ancestor's stored overflow grows to cover the box wherever a
+    /// scroll puts it, and never shrinks for one: a wider rect only prunes less. No ancestor
+    /// up to the root has a transform, or the box would not be shifted.
+    fn widen_ancestors_to(&mut self, id: NodeId) {
+        let layout = *self.nodes[id].final_layout();
+        let mut current = id;
+        while let Some(parent_id) = self.nodes[current].layout_parent.get() {
+            let overflow = self.overflow_in_parent_frame(current);
+            let parent = &mut self.nodes[parent_id];
+            let stored = parent.scrollable_overflow_mut();
+            *stored = stored.union(overflow);
+            if let Some(context) = &mut parent.stacking_context {
+                widen_content_area(context, id, &layout);
+            }
+            current = parent_id;
         }
     }
 
@@ -157,7 +227,7 @@ impl BaseDocument {
 
 #[cfg(test)]
 mod tests {
-    use crate::{Attribute, BaseDocument, DocumentConfig, NodeId, qual_name};
+    use crate::{Attribute, BaseDocument, DocumentConfig, NodeId, Point, qual_name};
     use blitz_traits::shell::{ColorScheme, Viewport};
 
     /// Lay out `<body style="margin:0"><div style="{wrapper}"><div style="{fixed}"></div></div>`
@@ -241,5 +311,98 @@ mod tests {
         assert_eq!(doc.hit(35.0, 25.0).map(|hit| hit.node_id), Some(fixed));
         // Where the box used to be (relative to the wrapper), only the wrapper is hit.
         assert_eq!(doc.hit(85.0, 75.0).map(|hit| hit.node_id), Some(wrapper));
+    }
+
+    fn scroll_to(doc: &mut BaseDocument, y: f64) {
+        doc.set_viewport_scroll(Point { x: 0.0, y });
+        doc.resolve(0.0);
+    }
+
+    #[test]
+    fn fixed_box_stays_on_screen_under_viewport_scroll() {
+        let (mut doc, _, fixed) = layout("margin:50px;width:100px;height:100px", FIXED);
+        scroll_to(&mut doc, 250.0);
+        assert_eq!(position(&doc, fixed), (30.0, 270.0), "scroll + inset");
+
+        scroll_to(&mut doc, 250.0);
+        assert_eq!(position(&doc, fixed), (30.0, 270.0), "repeat resolves hold");
+
+        scroll_to(&mut doc, 0.0);
+        assert_eq!(position(&doc, fixed), (30.0, 20.0), "scrolled back");
+    }
+
+    /// The transformed ancestor is the containing block, so the box scrolls off with it.
+    #[test]
+    fn scroll_shift_stops_at_a_transformed_ancestor() {
+        let (mut doc, _, fixed) = layout(
+            "margin:50px;width:100px;height:100px;transform:translate(0)",
+            FIXED,
+        );
+        scroll_to(&mut doc, 250.0);
+        assert_eq!(position(&doc, fixed), (80.0, 70.0));
+        assert_eq!(doc.hit(85.0, 75.0).map(|hit| hit.node_id), Some(fixed));
+    }
+
+    #[test]
+    fn fixed_box_inside_a_fixed_box_takes_the_shift_once() {
+        let (mut doc, _, inner) = layout(
+            "position:fixed;left:10px;top:10px;width:100px;height:100px",
+            FIXED,
+        );
+        scroll_to(&mut doc, 250.0);
+        assert_eq!(position(&doc, inner), (30.0, 270.0));
+    }
+
+    /// Measured before the shift, the box would count the scroll as distance to stick over
+    /// and take it twice.
+    #[test]
+    fn sticky_box_inside_a_fixed_box_stays_put_under_viewport_scroll() {
+        let (mut doc, _, sticky) = layout(
+            "position:fixed;left:0;top:0;width:100px;height:100px",
+            "display:block;position:sticky;top:0;width:40px;height:30px",
+        );
+        scroll_to(&mut doc, 250.0);
+        assert_eq!(position(&doc, sticky), (0.0, 250.0));
+    }
+
+    /// No damage recomputes the stored overflow for a scroll, so without the widening the
+    /// short wrapper and its ancestors would prune the box from the hit test.
+    #[test]
+    fn hit_test_reaches_a_fixed_box_scrolled_past_its_ancestors_overflow() {
+        let (mut doc, wrapper, fixed) = layout("width:100px;height:100px", FIXED);
+        scroll_to(&mut doc, 250.0);
+        assert_eq!(doc.hit(35.0, 275.0).map(|hit| hit.node_id), Some(fixed));
+        assert_eq!(
+            doc.hit(35.0, 25.0).map(|hit| hit.node_id),
+            Some(wrapper),
+            "its unscrolled position no longer hits it"
+        );
+    }
+
+    /// A non-zero `z-index` is reached through the stacking context's content area, which
+    /// the style flush computes before layout shifts the box.
+    #[test]
+    fn hit_test_reaches_a_hoisted_fixed_box_on_the_first_resolve_after_a_scroll() {
+        let (mut doc, _, fixed) = layout("width:100px;height:100px", &format!("{FIXED};z-index:1"));
+        scroll_to(&mut doc, 250.0);
+        assert_eq!(doc.hit(35.0, 275.0).map(|hit| hit.node_id), Some(fixed));
+    }
+
+    /// Overflow recomputed while scrolled holds only the scrolled position, yet scrolling
+    /// back sets no damage to recompute it again. The wrapper sits below both positions,
+    /// or its own box would span them.
+    #[test]
+    fn hit_test_reaches_a_fixed_box_scrolled_back_after_overflow_recomputed() {
+        let (mut doc, wrapper, fixed) = layout("margin-top:500px;width:100px;height:10px", FIXED);
+        scroll_to(&mut doc, 250.0);
+        doc.mutate().set_attribute(
+            wrapper,
+            qual_name!("style"),
+            "display:block;margin-top:500px;width:100px;height:15px",
+        );
+        doc.resolve(0.0);
+
+        scroll_to(&mut doc, 0.0);
+        assert_eq!(doc.hit(35.0, 25.0).map(|hit| hit.node_id), Some(fixed));
     }
 }
