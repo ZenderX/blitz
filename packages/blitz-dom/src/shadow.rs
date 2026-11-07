@@ -128,6 +128,27 @@ impl Node {
         self.containing_shadow_root_id().is_some()
     }
 
+    /// The host of the shadow tree containing this node, if any.
+    fn containing_host_id(&self) -> Option<NodeId> {
+        self.tree()
+            .get(self.containing_shadow_root_id()?)?
+            .shadow_host_id()
+    }
+
+    /// The host whose flat tree has this node's children as flat children or as
+    /// their assignment candidates: for a host, a shadow root and a `<slot>`.
+    fn host_of_flat_children(&self) -> Option<NodeId> {
+        if let Some(host) = self.shadow_host_id() {
+            Some(host)
+        } else if self.shadow_root_id().is_some() {
+            Some(self.id)
+        } else if self.is_slot_element() {
+            self.containing_host_id()
+        } else {
+            None
+        }
+    }
+
     /// Elements and text nodes can be assigned to a slot.
     fn is_slottable(&self) -> bool {
         match &self.data {
@@ -259,10 +280,13 @@ impl Node {
     /// Take the flat children out of the node so the tree can be mutated while
     /// they are visited; give them back with [`Node::restore_children`].
     ///
-    /// Hosts and slots are not emptied: their descendants resolve slot
-    /// assignment by reading the host's `children`, which must stay in place.
+    /// Hosts, slots and every node of a shadow tree are not emptied: their
+    /// descendants resolve slot assignment by reading the host's `children` and
+    /// by walking the shadow tree from its root, which must stay in place.
     pub(crate) fn take_children_for_iteration(&mut self) -> TakenChildren {
-        let flat = self.flat_children_override();
+        let flat = self
+            .flat_children_override()
+            .or_else(|| self.is_in_shadow_tree().then(|| self.children.to_vec()));
         let dom = if flat.is_some() {
             ThinVec::new()
         } else {
@@ -405,23 +429,29 @@ impl BaseDocument {
         host_node.mark_ancestors_dirty();
     }
 
-    /// Call after the child list of `parent` (or a text node directly below
-    /// it) changed, to refresh the flat tree where that matters: below a shadow
-    /// root, below a shadow host, and below a `<slot>`'s fallback content.
+    /// Call after a text node directly below `parent` changed, to refresh the
+    /// flat tree where that matters: below a shadow root, below a shadow host,
+    /// and below a `<slot>`'s fallback content.
+    pub(crate) fn invalidate_flat_tree_for_text_change(&mut self, parent: NodeId) {
+        let host = self.get_node(parent).and_then(Node::host_of_flat_children);
+        if let Some(host) = host {
+            self.invalidate_flat_tree(host);
+        }
+    }
+
+    /// Call after the child list of `parent` changed. Beyond what a text change
+    /// refreshes, any element of a shadow tree counts when its host has light
+    /// children: the change may have moved a `<slot>` and so reassigned them.
     pub(crate) fn invalidate_flat_tree_for_child_change(&mut self, parent: NodeId) {
         let Some(node) = self.get_node(parent) else {
             return;
         };
-        let host = if let Some(host) = node.shadow_host_id() {
-            Some(host)
-        } else if node.shadow_root_id().is_some() {
-            Some(parent)
-        } else if node.is_slot_element() {
-            node.containing_shadow_root_id()
-                .and_then(|root| self.shadow_host_of(root))
-        } else {
-            None
-        };
+        let host = node.host_of_flat_children().or_else(|| {
+            node.containing_host_id().filter(|host| {
+                self.get_node(*host)
+                    .is_some_and(|host| !host.children.is_empty())
+            })
+        });
         if let Some(host) = host {
             self.invalidate_flat_tree(host);
         }
@@ -691,6 +721,128 @@ mod tests {
         f.doc.mutate().remove_node(b);
         f.doc.resolve(0.0);
         assert_eq!(height(&f, host), 60.0);
+    }
+
+    /// A host holding `<div></div>` in its shadow tree and one 30px light child.
+    fn host_with_plain_child(f: &mut Fixture) -> (NodeId, NodeId, NodeId) {
+        let host = f.element("x-host", &[]);
+        f.append(f.body, &[host]);
+        let root = f.doc.attach_shadow_root(host).unwrap();
+        let div = f.element("div", &[]);
+        f.append(root, &[div]);
+        let light = f.element("p", &[("style", "height:30px")]);
+        f.append(host, &[light]);
+        (host, div, light)
+    }
+
+    /// Component markup rarely has its slot directly under the root; the wrapper
+    /// `<div>` must not cost the light child its box.
+    #[test]
+    fn a_slot_under_a_plain_element_gives_its_light_child_a_box() {
+        let mut f = Fixture::new();
+        let (host, div, light) = host_with_plain_child(&mut f);
+        let slot = f.element("slot", &[]);
+        f.append(div, &[slot]);
+
+        assert_eq!(f.layout_children(div), vec![light]);
+        assert_eq!(f.doc.nodes[light].layout_parent.get(), Some(div));
+        assert_eq!(height(&f, host), 30.0);
+    }
+
+    /// The same wrapper must not hide the slot from any ancestor's walk either.
+    #[test]
+    fn a_slot_below_two_plain_elements_gives_its_light_child_a_box() {
+        let mut f = Fixture::new();
+        let (host, div, light) = host_with_plain_child(&mut f);
+        let section = f.element("section", &[]);
+        let slot = f.element("slot", &[]);
+        f.append(section, &[slot]);
+        f.append(div, &[section]);
+
+        assert_eq!(f.layout_children(section), vec![light]);
+        assert_eq!(height(&f, host), 30.0);
+    }
+
+    /// A restyle of the slotted child has to reach the layout caches of its flat
+    /// ancestors, through the damage walk that passes the wrapper `<div>`.
+    #[test]
+    fn a_child_slotted_under_a_plain_element_relayouts_its_host() {
+        let mut f = Fixture::new();
+        let (host, div, light) = host_with_plain_child(&mut f);
+        let slot = f.element("slot", &[]);
+        f.append(div, &[slot]);
+        f.doc.resolve(0.0);
+        assert_eq!(height(&f, host), 30.0);
+
+        f.doc
+            .mutate()
+            .set_attribute(light, el("style"), "display:block;height:50px");
+        f.doc.resolve(0.0);
+        assert_eq!(height(&f, light), 50.0);
+        assert_eq!(height(&f, host), 50.0);
+    }
+
+    /// Script may add the slot after the first layout: the child it picks up has
+    /// never been styled, and leaving again must take its box along.
+    #[test]
+    fn a_slot_added_under_a_laid_out_plain_element_assigns_and_removal_unassigns() {
+        let mut f = Fixture::new();
+        let (host, div, light) = host_with_plain_child(&mut f);
+        assert_eq!(f.layout_children(div), Vec::<NodeId>::new());
+        assert_eq!(height(&f, host), 0.0, "nothing is slotted yet");
+
+        let slot = f.element("slot", &[]);
+        f.append(div, &[slot]);
+        assert_eq!(f.layout_children(div), vec![light]);
+        assert_eq!(height(&f, host), 30.0);
+
+        f.doc.mutate().remove_node(slot);
+        assert_eq!(f.layout_children(div), Vec::<NodeId>::new());
+        assert_eq!(height(&f, host), 0.0);
+    }
+
+    /// An earlier same-named slot takes the light child over from a slot under
+    /// another wrapper, whose box nothing else would rebuild: the child would stay
+    /// in two boxes, then in none once the earlier slot leaves.
+    #[test]
+    fn a_slot_added_under_a_plain_element_takes_the_child_from_a_later_wrapper() {
+        let mut f = Fixture::new();
+        let (host, div, light) = host_with_plain_child(&mut f);
+        let root = f.doc.shadow_root_of(host).unwrap();
+        let later_div = f.element("div", &[]);
+        let later = f.element("slot", &[]);
+        f.append(later_div, &[later]);
+        f.append(root, &[later_div]);
+        assert_eq!(f.layout_children(later_div), vec![light]);
+
+        let earlier = f.element("slot", &[]);
+        f.append(div, &[earlier]);
+        assert_eq!(f.doc.assigned_slot(light), Some(earlier));
+        assert_eq!(f.layout_children(div), vec![light]);
+        assert_eq!(f.layout_children(later_div), Vec::<NodeId>::new());
+
+        f.doc.mutate().remove_node(earlier);
+        assert_eq!(f.layout_children(div), Vec::<NodeId>::new());
+        assert_eq!(f.layout_children(later_div), vec![light]);
+    }
+
+    /// Editing text inside a shadow tree moves no slot, and restyling the whole
+    /// host for it would make every text update as costly as a re-render.
+    #[test]
+    fn text_under_a_plain_element_leaves_the_host_unrestyled() {
+        let mut f = Fixture::new();
+        let (host, div, _light) = host_with_plain_child(&mut f);
+        let slot = f.element("slot", &[]);
+        let text = f.doc.create_text_node("a");
+        f.append(div, &[slot, text]);
+        f.doc.resolve(0.0);
+
+        f.doc.mutate().set_node_text(text, "b");
+        let is_unhinted = f.doc.nodes[host]
+            .stylo_element_data_opt_mut()
+            .and_then(|s| s.get_mut())
+            .is_some_and(|data| data.hint.is_empty());
+        assert!(is_unhinted, "a text edit must not restyle the whole host");
     }
 
     #[test]
