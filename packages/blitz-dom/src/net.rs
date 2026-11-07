@@ -200,7 +200,16 @@ impl ServoStylesheetLoader for StylesheetLoader {
         supports: Option<ImportSupportsCondition>,
         layer: ImportLayer,
     ) -> ServoArc<Locked<ImportRule>> {
-        if !supports.as_ref().is_none_or(|s| s.enabled) {
+        let is_enabled = supports.as_ref().is_none_or(|s| s.enabled);
+        // The page writes this url, and `url()` is `None` when it cannot parse.
+        let Some(sheet_url) = url.url().filter(|_| is_enabled).cloned() else {
+            #[cfg(feature = "tracing")]
+            if is_enabled {
+                tracing::warn!(
+                    "Not loading @import: could not resolve url {}",
+                    url.as_str()
+                );
+            }
             return ServoArc::new(lock.wrap(ImportRule {
                 url,
                 stylesheet: ImportSheet::new_refused(),
@@ -208,9 +217,8 @@ impl ServoStylesheetLoader for StylesheetLoader {
                 layer,
                 source_location: location,
             }));
-        }
+        };
 
-        let sheet_url = url.url().unwrap().clone();
         // `ImportRule::to_css` reads the media off the imported sheet, so until
         // the load lands an empty sheet carries it: a `Pending` import would
         // re-serialize without its media and lose it on the next re-parse.
@@ -702,6 +710,44 @@ mod tests {
         assert_eq!(
             requests[0].headers.get("sec-fetch-dest"),
             Some(&HeaderValue::from_static("font")),
+        );
+    }
+
+    /// `http://[` comes from the page, and the host runs under `panic = "abort"`,
+    /// so a bad `@import` must cost that one rule and not its neighbours.
+    #[test]
+    fn an_unparsable_import_url_is_refused_and_a_valid_one_still_fetches() {
+        let lock = SharedRwLock::new();
+        let recorder = Arc::new(RecordingNetProvider(Default::default()));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let loader = StylesheetLoader {
+            tx,
+            doc_id: 0,
+            net_provider: recorder.clone(),
+            shell_provider: Arc::new(blitz_traits::shell::DummyShellProvider),
+            abort_signal: None,
+        };
+
+        let sheet = Stylesheet::from_str(
+            r#"@import url("http://["); @import url(good.css); p { color: red }"#,
+            Url::parse("https://example.com/style.css").unwrap().into(),
+            Origin::Author,
+            ServoArc::new(lock.wrap(MediaList::empty())),
+            lock.clone(),
+            Some(&loader),
+            None,
+            QuirksMode::NoQuirks,
+            AllowImportRules::Yes,
+        );
+
+        let requests = recorder.0.lock().unwrap();
+        assert_eq!(requests.len(), 1, "only the parsable @import is fetched");
+        assert_eq!(requests[0].url.as_str(), "https://example.com/good.css");
+        let guard = lock.read();
+        assert_eq!(
+            sheet.contents(&guard).rules(&guard).len(),
+            3,
+            "the refused rule keeps its place and the rules after it survive"
         );
     }
 }
