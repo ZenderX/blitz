@@ -138,7 +138,10 @@ pub struct TextInputData {
 // FIXME: Implement Clone for PlainEditor
 impl Clone for TextInputData {
     fn clone(&self) -> Self {
-        TextInputData::new(self.is_multiline)
+        let mut clone = TextInputData::new(self.is_multiline);
+        // Box construction seeds only an element with no editor yet, so the text comes from here.
+        clone.editor.set_text(&self.editor.text().to_string());
+        clone
     }
 }
 

@@ -1307,7 +1307,6 @@ impl<'doc> DocumentMutator<'doc> {
     }
 }
 
-/// Set 'checked' state on an input based on given attributevalue
 /// Show a `<textarea>`'s child text in its editor, unless a `value` attribute
 /// overrides it. A node with no editor yet is seeded when its box is constructed.
 fn sync_textarea_editor(doc: &mut BaseDocument, node_id: NodeId) {
@@ -1331,6 +1330,7 @@ fn sync_textarea_editor(doc: &mut BaseDocument, node_id: NodeId) {
     }
 }
 
+/// Set 'checked' state on an input based on given attributevalue
 fn set_input_checked_state(element: &mut ElementData, value: String) {
     let Ok(checked) = value.parse() else {
         return;
