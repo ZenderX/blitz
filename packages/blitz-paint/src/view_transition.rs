@@ -169,7 +169,7 @@ impl BlitzDomPainter<'_, '_> {
             f64::from(location.y) * self.scale,
         ));
         self.live_capture.set(Some(element));
-        self.render_element(scene, element, transform * unplaced, clip_rect);
+        self.render_element(scene, element, transform * unplaced, clip_rect, None);
         self.live_capture.set(None);
     }
 

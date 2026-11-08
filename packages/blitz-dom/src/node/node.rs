@@ -1,6 +1,7 @@
 use crate::Document;
 pub use crate::layout::damage::HoistedPaintChild;
 use crate::layout::damage::HoistedPaintChildren;
+use crate::layout::fixed::establishes_fixed_containing_block;
 use bitflags::bitflags;
 use blitz_traits::events::{
     BlitzPointerEvent, BlitzPointerId, DomEventData, HitResult, PointerCoords,
@@ -1422,9 +1423,15 @@ impl Node {
             .is_some_and(|parent_id| matches!(self.with(parent_id).data, NodeData::Document(_)))
     }
 
+    /// Whether this box is the containing block of its `position: fixed` descendants.
+    pub fn establishes_fixed_containing_block(&self) -> bool {
+        self.primary_styles()
+            .is_some_and(|style| establishes_fixed_containing_block(&style))
+    }
+
     /// Whether this box clips its overflow itself, as every box does but the root element
     /// and a `<body>` whose overflow belongs to the viewport.
-    pub fn clips_own_overflow(&self) -> bool {
+    pub(crate) fn clips_own_overflow(&self) -> bool {
         let overflow = self.style().overflow;
         (overflow.x != taffy::Overflow::Visible || overflow.y != taffy::Overflow::Visible)
             && !self.is_root_element()
