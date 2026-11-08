@@ -505,10 +505,10 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                     .unwrap_or(Rect::ZERO);
 
                 let has_effect_layer = has_opacity || filter.is_some() || backdrop_filter.is_some();
-                let has_released_child = node
+                let has_released_box = node
                     .stacking_context
                     .as_ref()
-                    .is_some_and(|context| context.children.iter().any(|c| c.escapes_context_clip));
+                    .is_some_and(|context| context.has_released_box);
 
                 let mut effect_layer_clip = border_box;
                 effect_layer_clip.x0 += filter_expansion_area.x0;
@@ -521,8 +521,8 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                     effect_layer_clip = region;
                 }
 
-                // Released children only occur under opacity: a filter is their containing block.
-                let (effect_layer_transform, effect_layer_clip) = if has_released_child {
+                // Released boxes only occur under opacity: a filter is their containing block.
+                let (effect_layer_transform, effect_layer_clip) = if has_released_box {
                     let origin = Vec2::new(self.initial_x, self.initial_y);
                     (Affine::IDENTITY, clip_rect + origin)
                 } else {

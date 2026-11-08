@@ -338,6 +338,10 @@ pub struct HoistedPaintChildren {
     pub negative_z_count: u32,
 
     pub content_area: taffy::Rect<f32>,
+
+    /// Whether a fixed box whose containing block lies above this box paints in this context
+    /// or in one nested in it, so that it can paint past this box's border box.
+    pub has_released_box: bool,
 }
 
 impl HoistedPaintChildren {
@@ -346,6 +350,7 @@ impl HoistedPaintChildren {
             children: Vec::new(),
             negative_z_count: 0,
             content_area: taffy::Rect::ZERO,
+            has_released_box: false,
         }
     }
 
@@ -492,6 +497,9 @@ impl BaseDocument {
         let mut preorder = Vec::new();
         while let Some(id) = stack.pop() {
             preorder.push(id);
+            if let Some(context) = self.nodes[id].stacking_context.as_mut() {
+                context.has_released_box = false;
+            }
             if let Some(children) = self.nodes[id].layout_children.borrow().as_ref() {
                 stack.extend(children.iter().copied());
             }
@@ -506,7 +514,26 @@ impl BaseDocument {
                     self.place_in_stacking_context(child.node_id, id, child.z_index == 0);
             }
             context.compute_content_size(self);
+            let has_released_child = context.children.iter().any(|c| c.escapes_context_clip);
             self.nodes[id].stacking_context = Some(context);
+            if has_released_child {
+                self.mark_released_box(id);
+            }
+        }
+    }
+
+    /// Record a box released through the stacking context `id` on that context and on each
+    /// context around it, up to the box's containing block.
+    fn mark_released_box(&mut self, id: NodeId) {
+        let mut ancestor = Some(id);
+        while let Some(id) =
+            ancestor.filter(|&id| !self.nodes[id].establishes_fixed_containing_block())
+        {
+            let node = &mut self.nodes[id];
+            if let Some(context) = node.stacking_context.as_mut() {
+                context.has_released_box = true;
+            }
+            ancestor = node.layout_parent.get();
         }
     }
 
