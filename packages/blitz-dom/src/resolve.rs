@@ -34,6 +34,7 @@ use crate::{
             collect_layout_children,
         },
         damage::{ALL_DAMAGE, CONSTRUCT_BOX, CONSTRUCT_DESCENDENT, CONSTRUCT_FC},
+        pass_timing::{LayoutPassTimer, Pass, time_pass},
     },
     node::TextBrush,
 };
@@ -409,7 +410,8 @@ impl BaseDocument {
     /// TODO: update taffy to use an associated type instead of slab key
     /// TODO: update taffy to support traited styles so we don't even need to rely on taffy for storage
     pub fn resolve_layout(&mut self) {
-        let sizes_before = self.box_sizes();
+        let mut timer = LayoutPassTimer::start();
+        let sizes_before = time_pass(&mut timer, Pass::SizeComparison, || self.box_sizes());
         let size = self.stylist.device().au_viewport_size();
 
         let available_space = taffy::Size {
@@ -425,10 +427,17 @@ impl BaseDocument {
         let scrolled_fixed_boxes = self.layout_fixed_boxes();
         taffy::round_layout(self, root_element_id);
         self.map_vertical_layouts(self.root_element().id);
-        self.scroll_fixed_boxes(&scrolled_fixed_boxes);
+        time_pass(&mut timer, Pass::FixedOverflow, || {
+            self.scroll_fixed_boxes(&scrolled_fixed_boxes)
+        });
         self.layout_sticky_boxes();
-        self.place_hoisted_children();
-        self.damage_overflow_of_resized_boxes(&sizes_before);
+        time_pass(&mut timer, Pass::Hoisting, || self.place_hoisted_children());
+        time_pass(&mut timer, Pass::SizeComparison, || {
+            self.damage_overflow_of_resized_boxes(&sizes_before)
+        });
+        if let Some(timer) = timer {
+            timer.finish(self.nodes.len());
+        }
 
         // println!("\n\n");
         // taffy::print_tree(self, root_node_id)
@@ -458,7 +467,7 @@ impl BaseDocument {
             let mut current = Some(node_id);
             while let Some(id) = current {
                 let node = &mut self.nodes[id];
-                // Damage propagation already gave this overflow damage to every ancestor
+                // Damage propagation already gave this overflow damage to every ancestor.
                 if node
                     .damage()
                     .is_some_and(|d| d.contains(RestyleDamage::RECALCULATE_OVERFLOW))

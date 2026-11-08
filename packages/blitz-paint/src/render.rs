@@ -1155,14 +1155,12 @@ impl ElementCx<'_, '_> {
 
         if let Some(hoisted) = &self.node.stacking_context {
             for hoisted_child in hoisted.neg_z_hoisted_children() {
-                let pos = kurbo::Vec2 {
-                    x: hoisted_child.position.x as f64 * self.scale,
-                    y: hoisted_child.position.y as f64 * self.scale,
-                };
-                self.render_node(
+                self.draw_hoisted_child(
                     scene,
                     hoisted_child.node_id,
-                    parent_style_transform.pre_translate(pos),
+                    hoisted_child.position,
+                    hoisted_child.clip,
+                    parent_style_transform,
                     clip_rect,
                 );
             }
@@ -1178,18 +1176,57 @@ impl ElementCx<'_, '_> {
         // Positive z_index hoisted nodes
         if let Some(hoisted) = &self.node.stacking_context {
             for hoisted_child in hoisted.pos_z_hoisted_children() {
-                let pos = kurbo::Vec2 {
-                    x: hoisted_child.position.x as f64 * self.scale,
-                    y: hoisted_child.position.y as f64 * self.scale,
-                };
-                self.render_node(
+                self.draw_hoisted_child(
                     scene,
                     hoisted_child.node_id,
-                    parent_style_transform.pre_translate(pos),
+                    hoisted_child.position,
+                    hoisted_child.clip,
+                    parent_style_transform,
                     clip_rect,
                 );
             }
         }
+    }
+
+    /// Draw a hoisted child at `position`, inside the clip of the boxes it was hoisted past.
+    fn draw_hoisted_child(
+        &self,
+        scene: &mut impl PaintScene,
+        node_id: NodeId,
+        position: taffy::Point<f32>,
+        clip: Option<taffy::Rect<f32>>,
+        parent_style_transform: Affine,
+        clip_rect: Rect,
+    ) {
+        let pos = kurbo::Vec2 {
+            x: position.x as f64 * self.scale,
+            y: position.y as f64 * self.scale,
+        };
+        let clip = clip.map(|clip| {
+            Rect::new(
+                clip.left as f64 * self.scale,
+                clip.top as f64 * self.scale,
+                clip.right as f64 * self.scale,
+                clip.bottom as f64 * self.scale,
+            )
+        });
+        self.layer_manager.maybe_with_layer(
+            scene,
+            clip.is_some(),
+            1.0,
+            parent_style_transform,
+            &clip.unwrap_or(Rect::ZERO),
+            None,
+            None,
+            |scene| {
+                self.render_node(
+                    scene,
+                    node_id,
+                    parent_style_transform.pre_translate(pos),
+                    clip_rect,
+                )
+            },
+        );
     }
 
     #[cfg(feature = "svg")]

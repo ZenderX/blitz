@@ -30,6 +30,7 @@ pub(crate) mod hyphenation;
 pub(crate) mod inline;
 pub(crate) mod list;
 pub(crate) mod multicol;
+pub(crate) mod pass_timing;
 pub(crate) mod replaced;
 pub(crate) mod ruby;
 #[cfg(feature = "floats")]

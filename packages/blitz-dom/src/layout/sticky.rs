@@ -13,7 +13,8 @@
 //!
 //! A sticky box inside a scroll container other than the viewport keeps its in-flow
 //! position: the scroll offset of such a container is not tracked here. Boxes placed by an
-//! ancestor's sticky shift move with it, because ancestors are shifted first.
+//! ancestor's sticky shift move with it, because ancestors are shifted first, except a
+//! fixed box whose containing block is the viewport, which is shifted back.
 //!
 //! The root element's `overflow`, and the `<body>`'s when the root's is `visible`, belongs
 //! to the viewport: neither makes its descendants' scroll container something else.
@@ -65,11 +66,6 @@ impl Axis {
     }
 }
 
-fn is_sticky_positioned(node: &Node) -> bool {
-    node.primary_styles()
-        .is_some_and(|style| matches!(style.clone_position(), Position::Sticky))
-}
-
 fn is_scroll_container(node: &Node) -> bool {
     node.primary_styles().is_some_and(|style| {
         clips_overflow(style.clone_overflow_x()) || clips_overflow(style.clone_overflow_y())
@@ -109,7 +105,8 @@ impl BaseDocument {
     }
 
     /// Shift every sticky box toward its insets. Runs after rounding, so each box starts
-    /// from its in-flow position.
+    /// from its in-flow position. A fixed box inside a shifted one gets the shifts carried
+    /// since its nearest fixed ancestor back, if its containing block is the viewport.
     pub(crate) fn layout_sticky_boxes(&mut self) {
         let root = self.root_element();
         let root_id = root.id;
@@ -117,13 +114,32 @@ impl BaseDocument {
         // viewport too (CSS Overflow 3), so body is not a scroll container.
         let body_overflow_is_propagated = !is_scroll_container(root);
 
-        // Pre-order, so a sticky box nested in another is placed after its ancestor.
-        let mut sticky_boxes = Vec::new();
-        let mut stack = vec![(root_id, false)];
-        while let Some((id, is_in_scroll_container)) = stack.pop() {
+        // Pre-order, so a box is placed after its ancestors and before its descendants,
+        // which measure from where it ends up.
+        let mut stack = vec![(root_id, false, taffy::Point::ZERO)];
+        while let Some((id, is_in_scroll_container, carried_shift)) = stack.pop() {
             let Some(node) = self.nodes.get(id) else {
                 continue;
             };
+            let position = node.primary_styles().map(|style| style.clone_position());
+            let child_shift = match position {
+                Some(Position::Sticky) if !is_in_scroll_container => {
+                    let shift = self.layout_sticky_box(id);
+                    taffy::Point {
+                        x: carried_shift.x + shift.x,
+                        y: carried_shift.y + shift.y,
+                    }
+                }
+                Some(Position::Fixed) => {
+                    if carried_shift != taffy::Point::ZERO {
+                        self.cancel_sticky_shift(id, carried_shift);
+                    }
+                    taffy::Point::ZERO
+                }
+                _ => carried_shift,
+            };
+
+            let node = &self.nodes[id];
             if let Some(children) = node.layout_children.borrow().as_ref() {
                 // The root element's overflow belongs to the viewport.
                 let is_viewport_overflow = id == root_id
@@ -136,22 +152,16 @@ impl BaseDocument {
                     children
                         .iter()
                         .rev()
-                        .map(|&child| (child, is_child_in_scroll_container)),
+                        .map(|&child| (child, is_child_in_scroll_container, child_shift)),
                 );
             }
-            if !is_in_scroll_container && is_sticky_positioned(node) {
-                sticky_boxes.push(id);
-            }
-        }
-
-        for id in sticky_boxes {
-            self.layout_sticky_box(id);
         }
     }
 
-    fn layout_sticky_box(&mut self, id: NodeId) {
+    /// Shift a sticky box toward its insets; returns the shift.
+    fn layout_sticky_box(&mut self, id: NodeId) -> taffy::Point<f32> {
         let Some(parent_id) = self.nodes[id].layout_parent.get() else {
-            return;
+            return taffy::Point::ZERO;
         };
 
         let viewport = self.stylist.device().au_viewport_size();
@@ -161,7 +171,7 @@ impl BaseDocument {
 
         let node = &self.nodes[id];
         let Some(style) = node.primary_styles() else {
-            return;
+            return taffy::Point::ZERO;
         };
         let position = style.get_position();
         let top = resolve_inset(&position.top, port_height);
@@ -170,7 +180,7 @@ impl BaseDocument {
         let right = resolve_inset(&position.right, port_width);
         drop(style);
         if top.is_none() && bottom.is_none() && left.is_none() && right.is_none() {
-            return;
+            return taffy::Point::ZERO;
         }
 
         let layout = node.final_layout();
@@ -218,9 +228,14 @@ impl BaseDocument {
             inset_end: bottom,
         };
 
+        let shift = taffy::Point {
+            x: horizontal.offset(),
+            y: vertical.offset(),
+        };
         let location = &mut self.nodes[id].final_layout_mut().location;
-        location.x += horizontal.offset();
-        location.y += vertical.offset();
+        location.x += shift.x;
+        location.y += shift.y;
+        shift
     }
 }
 
@@ -390,6 +405,50 @@ mod tests {
         let (mut doc, sticky) = layout_with("overflow:hidden", "overflow:hidden", 0, "", "top:0");
         scroll_to(&mut doc, 0.0, 250.0);
         assert_eq!(position(&doc, sticky), (0.0, 100.0), "stays in flow");
+    }
+
+    /// Append `<div style="{style}">` to `parent` and lay out again.
+    fn append_child(doc: &mut BaseDocument, parent: NodeId, style: &str) -> NodeId {
+        let mut mutator = doc.mutate();
+        let child = mutator.create_element(
+            qual_name!("div"),
+            vec![Attribute {
+                name: qual_name!("style"),
+                value: style.to_string(),
+            }],
+        );
+        mutator.append_children(parent, &[child]);
+        drop(mutator);
+        doc.resolve(0.0);
+        child
+    }
+
+    const FIXED: &str = "position:fixed;left:50px;top:20px;width:40px;height:30px";
+
+    /// The box is placed from the viewport, so the stuck ancestor's shift must not carry
+    /// it; the hit test reaches it outside the ancestor's own box.
+    #[test]
+    fn a_fixed_box_inside_a_stuck_box_keeps_its_viewport_position() {
+        let (mut doc, sticky) = layout(0, "", "top:0");
+        let fixed = append_child(&mut doc, sticky, FIXED);
+        scroll_to(&mut doc, 0.0, 250.0);
+        assert_eq!(position(&doc, sticky), (0.0, 250.0), "stuck");
+        assert_eq!(position(&doc, fixed), (50.0, 270.0), "scroll + inset only");
+        assert_eq!(doc.hit(55.0, 275.0).map(|hit| hit.node_id), Some(fixed));
+
+        scroll_to(&mut doc, 0.0, 0.0);
+        assert_eq!(position(&doc, fixed), (50.0, 20.0), "scrolled back");
+    }
+
+    /// A transformed sticky box is the fixed box's containing block, so the fixed box
+    /// moves with it: 10px below the stuck box, not 20px below the viewport's top.
+    #[test]
+    fn a_fixed_box_contained_by_a_stuck_box_moves_with_it() {
+        let (mut doc, sticky) = layout(0, "", "top:10px;transform:translate(0)");
+        let fixed = append_child(&mut doc, sticky, FIXED);
+        scroll_to(&mut doc, 0.0, 250.0);
+        assert_eq!(position(&doc, sticky), (0.0, 260.0), "stuck");
+        assert_eq!(position(&doc, fixed), (50.0, 280.0));
     }
 
     #[test]

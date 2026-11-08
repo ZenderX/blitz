@@ -1295,6 +1295,9 @@ impl Node {
         if matches_hoisted_content {
             if let Some(hoisted) = &self.stacking_context {
                 for hoisted_child in hoisted.pos_z_hoisted_children().rev() {
+                    if !hoisted_child.is_visible_at(x, y) {
+                        continue;
+                    }
                     let x = x - hoisted_child.position.x;
                     let y = y - hoisted_child.position.y;
                     if let Some(hit) = self
