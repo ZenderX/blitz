@@ -1342,9 +1342,7 @@ impl Node {
             y -= content_box_offset.y;
         }
 
-        // Whether a hoisted child is searched clipped out, or `None` if it cannot answer here.
-        // A descendant steps out only of clip layers open directly around it, so one under
-        // the child's own carried clip or a fixed containing block stays clipped.
+        // Whether a hoisted child is searched clipped out, or `None` if paint keeps it clipped.
         let hoisted_clip_state = |child: &HoistedPaintChild| {
             if !child.is_visible_at(x, y) {
                 return None;
