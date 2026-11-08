@@ -1161,10 +1161,6 @@ impl Node {
         let position = style.clone_position();
         let has_z_index = !style.clone_z_index().is_auto();
 
-        if style.clone_opacity() != 1.0 {
-            return true;
-        }
-
         let position_based = match position {
             Position::Fixed | Position::Sticky => true,
             Position::Relative | Position::Absolute => has_z_index,
@@ -1178,17 +1174,7 @@ impl Node {
             return true;
         }
 
-        let effects = style.get_effects();
-        if !effects.filter.0.is_empty()
-            || !effects.backdrop_filter.0.is_empty()
-            || !matches!(style.clone_clip_path(), ClipPath::None)
-            || style
-                .get_svg()
-                .mask_image
-                .0
-                .iter()
-                .any(|image| !matches!(image, StyloImage::None))
-        {
+        if self.paints_in_group_layer() {
             return true;
         }
 
@@ -1197,6 +1183,24 @@ impl Node {
         // TODO: contain
 
         false
+    }
+
+    /// Whether paint draws this box in a group layer (opacity, a filter, a clip-path or a
+    /// mask), which a descendant cannot step out of to leave an overflow clip around it.
+    fn paints_in_group_layer(&self) -> bool {
+        self.primary_styles().is_some_and(|style| {
+            let effects = style.get_effects();
+            style.clone_opacity() != 1.0
+                || !effects.filter.0.is_empty()
+                || !effects.backdrop_filter.0.is_empty()
+                || !matches!(style.clone_clip_path(), ClipPath::None)
+                || style
+                    .get_svg()
+                    .mask_image
+                    .0
+                    .iter()
+                    .any(|image| !matches!(image, StyloImage::None))
+        })
     }
 
     /// Takes an (x, y) position (relative to the *parent's* top-left corner) and returns:
@@ -1222,8 +1226,28 @@ impl Node {
         scale: f64,
         scrollbar: &mut Option<crate::node::ScrollbarRef>,
     ) -> Option<HitResult> {
+        self.hit_in_clip(x, y, scale, scrollbar, false)
+    }
+
+    /// With `is_clipped_out`, the point lies outside an overflow clip around this box, so only
+    /// a box released from that clip can answer, as only such a box paints there. The search
+    /// ends where paint's chain of steppable clip layers does.
+    fn hit_in_clip(
+        &self,
+        x: f32,
+        y: f32,
+        scale: f64,
+        scrollbar: &mut Option<crate::node::ScrollbarRef>,
+        is_clipped_out: bool,
+    ) -> Option<HitResult> {
         use style::computed_values::pointer_events::T as PointerEvents;
         use style::computed_values::visibility::T as Visibility;
+
+        if is_clipped_out
+            && (self.paints_in_group_layer() || self.establishes_fixed_containing_block())
+        {
+            return None;
+        }
 
         // Don't hit on visbility:hidden elements
         if let Some(style) = self.primary_styles() {
@@ -1300,6 +1324,7 @@ impl Node {
         // Descendants overwrite, so the innermost scroll container's thumb
         // wins. Thumb coords are border-box relative (unscrolled).
         if matches_self
+            && !is_clipped_out
             && let Some(sb) = self.scrollbar_at_local(
                 (x - self.scroll_offset().x as f32) as f64,
                 (y - self.scroll_offset().y as f32) as f64,
@@ -1317,21 +1342,35 @@ impl Node {
             y -= content_box_offset.y;
         }
 
+        // Whether a hoisted child is searched clipped out, or `None` if it cannot answer here.
+        // A descendant steps out only of clip layers open directly around it, so one under
+        // the child's own carried clip or a fixed containing block stays clipped.
+        let hoisted_clip_state = |child: &HoistedPaintChild| {
+            if !child.is_visible_at(x, y) {
+                return None;
+            }
+            if child.escapes_context_clip || !(is_clipped_out || is_outside_own_clip) {
+                return Some(false);
+            }
+            (child.clip.is_none() && !self.establishes_fixed_containing_block()).then_some(true)
+        };
+
         // Positive z_index hoisted children
         if matches_hoisted_content {
             if let Some(hoisted) = &self.stacking_context {
                 for hoisted_child in hoisted.pos_z_hoisted_children().rev() {
-                    if !hoisted_child.is_visible_at(x, y)
-                        || (is_outside_own_clip && !hoisted_child.escapes_context_clip)
-                    {
+                    let Some(is_child_clipped_out) = hoisted_clip_state(hoisted_child) else {
                         continue;
-                    }
+                    };
                     let x = x - hoisted_child.position.x;
                     let y = y - hoisted_child.position.y;
-                    if let Some(hit) = self
-                        .with(hoisted_child.node_id)
-                        .hit_inner(x, y, scale, scrollbar)
-                    {
+                    if let Some(hit) = self.with(hoisted_child.node_id).hit_in_clip(
+                        x,
+                        y,
+                        scale,
+                        scrollbar,
+                        is_child_clipped_out,
+                    ) {
                         return Some(hit);
                     }
                 }
@@ -1340,7 +1379,10 @@ impl Node {
 
         // Call `.hit()` on each child in turn. If any return `Some` then return that value. Else return `Some(self.id).
         for child_id in self.paint_children.borrow().iter().flatten().rev() {
-            if let Some(hit) = self.with(*child_id).hit_inner(x, y, scale, scrollbar) {
+            if let Some(hit) =
+                self.with(*child_id)
+                    .hit_in_clip(x, y, scale, scrollbar, is_clipped_out)
+            {
                 return Some(hit);
             }
         }
@@ -1349,19 +1391,26 @@ impl Node {
         if matches_hoisted_content {
             if let Some(hoisted) = &self.stacking_context {
                 for hoisted_child in hoisted.neg_z_hoisted_children().rev() {
-                    if is_outside_own_clip && !hoisted_child.escapes_context_clip {
+                    let Some(is_child_clipped_out) = hoisted_clip_state(hoisted_child) else {
                         continue;
-                    }
+                    };
                     let x = x - hoisted_child.position.x;
                     let y = y - hoisted_child.position.y;
-                    if let Some(hit) = self
-                        .with(hoisted_child.node_id)
-                        .hit_inner(x, y, scale, scrollbar)
-                    {
+                    if let Some(hit) = self.with(hoisted_child.node_id).hit_in_clip(
+                        x,
+                        y,
+                        scale,
+                        scrollbar,
+                        is_child_clipped_out,
+                    ) {
                         return Some(hit);
                     }
                 }
             }
+        }
+
+        if is_clipped_out {
+            return None;
         }
 
         // Inline children
