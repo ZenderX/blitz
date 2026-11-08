@@ -14,7 +14,6 @@ use style::properties::generated::longhands::position::computed_value::T as Posi
 use style::selector_parser::RestyleDamage;
 use style::url::ComputedUrl;
 use style::values::computed::Float;
-use style::values::computed::Overflow;
 use style::values::computed::basic_shape::ClipPath;
 use style::values::computed::image::Image as ComputedImage;
 use style::values::generics::basic_shape::ShapeOutside;
@@ -313,6 +312,18 @@ pub struct HoistedPaintChild {
     pub node_id: NodeId,
     pub z_index: i32,
     pub position: taffy::Point<f32>,
+    /// For a box hoisted at `z-index` 0, the padding boxes of the overflow-clipping boxes it
+    /// was hoisted past, intersected, in the frame of `position`; `None` when it passed none.
+    pub clip: Option<taffy::Rect<f32>>,
+}
+
+impl HoistedPaintChild {
+    /// Whether its clip, if any, leaves the point (in the frame of `position`) visible.
+    pub fn is_visible_at(&self, x: f32, y: f32) -> bool {
+        self.clip.is_none_or(|clip| {
+            x >= clip.left && x <= clip.right && y >= clip.top && y <= clip.bottom
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -450,7 +461,9 @@ impl BaseDocument {
                 continue;
             };
             for child in &mut context.children {
-                child.position = self.offset_from_stacking_context(child.node_id, id);
+                // Only boxes at z-index 0 are hoisted past an overflow clip.
+                (child.position, child.clip) =
+                    self.place_in_stacking_context(child.node_id, id, child.z_index == 0);
             }
             context.compute_content_size(self);
             self.nodes[id].stacking_context = Some(context);
@@ -458,19 +471,48 @@ impl BaseDocument {
     }
 
     /// The origin of `id`'s layout parent in the frame the stacking context `root` paints its
-    /// children in.
-    fn offset_from_stacking_context(&self, id: NodeId, root: NodeId) -> taffy::Point<f32> {
+    /// children in and, with `is_clipped`, the intersection of the padding boxes of the
+    /// overflow-clipping boxes between them in that frame.
+    fn place_in_stacking_context(
+        &self,
+        id: NodeId,
+        root: NodeId,
+        is_clipped: bool,
+    ) -> (taffy::Point<f32>, Option<taffy::Rect<f32>>) {
         let mut offset = taffy::Point::ZERO;
+        // Kept less the offset carried so far, which moves every clip alike once complete.
+        let mut clip: Option<taffy::Rect<f32>> = None;
         let mut ancestor = self.nodes[id].layout_parent.get();
         while let Some(id) = ancestor.filter(|&id| id != root) {
             let node = &self.nodes[id];
-            let location = node.final_layout().location;
+            let layout = node.final_layout();
+            let location = layout.location;
             let scroll_offset = node.scroll_offset();
             offset.x += location.x - scroll_offset.x as f32;
             offset.y += location.y - scroll_offset.y as f32;
+            if is_clipped && clips_overflow(node.style()) {
+                let padding_box = taffy::Rect {
+                    left: location.x + layout.border.left - offset.x,
+                    right: location.x + layout.size.width - layout.border.right - offset.x,
+                    top: location.y + layout.border.top - offset.y,
+                    bottom: location.y + layout.size.height - layout.border.bottom - offset.y,
+                };
+                clip = Some(clip.map_or(padding_box, |clip| taffy::Rect {
+                    left: clip.left.max(padding_box.left),
+                    right: clip.right.min(padding_box.right),
+                    top: clip.top.max(padding_box.top),
+                    bottom: clip.bottom.min(padding_box.bottom),
+                }));
+            }
             ancestor = node.layout_parent.get();
         }
-        offset
+        let clip = clip.map(|clip| taffy::Rect {
+            left: clip.left + offset.x,
+            right: clip.right + offset.x,
+            top: clip.top + offset.y,
+            bottom: clip.bottom + offset.y,
+        });
+        (offset, clip)
     }
 
     /// The `z-index` to hoist `child_id` to its stacking context with, or `None` to paint it
@@ -758,6 +800,7 @@ impl BaseDocument {
                                 node_id: child_id,
                                 z_index,
                                 position: taffy::Point::ZERO,
+                                clip: None,
                             },
                         );
                     }
@@ -791,15 +834,13 @@ impl BaseDocument {
     }
 }
 
-/// Whether a box holds its descendants in a clip, a group effect or a containing block for
-/// fixed boxes, which a box of `z-index` auto hoisted past it would escape. Some of these are
+/// Whether a box holds its descendants in a group effect or a containing block for fixed
+/// boxes, which a box of `z-index` auto hoisted past it would escape. Some of these are
 /// stacking contexts by spec, but `is_stacking_context_root` knows only some of them, and a
-/// `transform` only from the second flush.
+/// `transform` only from the second flush. An overflow clip does not confine: the hoisted box
+/// carries it along (see [`HoistedPaintChild::clip`]).
 fn confines_descendants(style: &ComputedValues) -> bool {
-    let box_style = style.get_box();
     establishes_fixed_containing_block(style)
-        || !matches!(box_style.overflow_x, Overflow::Visible)
-        || !matches!(box_style.overflow_y, Overflow::Visible)
         || !style.get_effects().backdrop_filter.0.is_empty()
         || !matches!(style.clone_clip_path(), ClipPath::None)
         || style
@@ -808,6 +849,11 @@ fn confines_descendants(style: &ComputedValues) -> bool {
             .0
             .iter()
             .any(|image| !matches!(image, StyloImage::None))
+}
+
+/// Whether a box clips its overflow, as painting does for every box but the root element.
+fn clips_overflow(style: &taffy::Style<style::Atom>) -> bool {
+    style.overflow.x != taffy::Overflow::Visible || style.overflow.y != taffy::Overflow::Visible
 }
 
 #[inline(always)]
@@ -851,5 +897,182 @@ fn node_to_paint_order(node: &Node, is_flex_or_grid: bool) -> (i32, i32) {
             position_to_order(position) + float_to_order(style.clone_float()),
             0,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{Attribute, BaseDocument, DocumentConfig, NodeId, Point, qual_name};
+    use blitz_traits::shell::{ColorScheme, Viewport};
+
+    /// `<html><body style="margin:0">` in a 400x300 viewport; returns the document and body.
+    fn page() -> (BaseDocument, NodeId) {
+        let mut doc = BaseDocument::new(DocumentConfig {
+            viewport: Some(Viewport::new(400, 300, 1.0, ColorScheme::Light)),
+            ..Default::default()
+        });
+        let root_id = doc.root_node().id;
+        let html = append(&mut doc, root_id, "");
+        let body = append(&mut doc, html, "margin:0");
+        (doc, body)
+    }
+
+    /// Append a `display:block` div styled `style` (no UA stylesheet is loaded) to `parent`.
+    fn append(doc: &mut BaseDocument, parent: NodeId, style: &str) -> NodeId {
+        let mut mutator = doc.mutate();
+        let id = mutator.create_element(
+            qual_name!("div"),
+            vec![Attribute {
+                name: qual_name!("style"),
+                value: format!("display:block;{style}"),
+            }],
+        );
+        mutator.append_children(parent, &[id]);
+        id
+    }
+
+    fn hit(doc: &BaseDocument, x: f32, y: f32) -> Option<NodeId> {
+        doc.hit(x, y).map(|hit| hit.node_id)
+    }
+
+    fn hoisted_clip(doc: &BaseDocument, id: NodeId) -> Option<taffy::Rect<f32>> {
+        let context = doc.root_element().stacking_context.as_ref().unwrap();
+        let child = context.children.iter().find(|child| child.node_id == id);
+        child.expect("hoisted to the root stacking context").clip
+    }
+
+    const CLIPPER: &str = "width:200px;height:100px;overflow:hidden";
+    const FIXED: &str = "position:fixed;left:10px;top:10px;width:50px;height:50px";
+
+    /// CSS 2.1 Appendix E step 8: the fixed box paints above in-flow content, even content
+    /// after its static parent inside an ancestor that clips it.
+    #[test]
+    fn a_fixed_box_under_a_clip_paints_above_the_in_flow_content_after_it() {
+        let (mut doc, body) = page();
+        let clipper = append(&mut doc, body, CLIPPER);
+        let header = append(&mut doc, clipper, "height:20px");
+        let fixed = append(&mut doc, header, FIXED);
+        let later = append(&mut doc, clipper, "height:80px");
+        doc.resolve(0.0);
+
+        let header_paints = doc.nodes[header].paint_children.borrow().clone();
+        assert!(
+            !header_paints.unwrap_or_default().contains(&fixed),
+            "not painted with its static parent, under the later content"
+        );
+        assert_eq!(
+            hoisted_clip(&doc, fixed),
+            Some(taffy::Rect {
+                left: 0.0,
+                right: 200.0,
+                top: 0.0,
+                bottom: 100.0
+            }),
+            "hoisted with the clipper's padding box"
+        );
+        assert_eq!(
+            hit(&doc, 20.0, 30.0),
+            Some(fixed),
+            "the overlap is the fixed box"
+        );
+        assert_eq!(
+            hit(&doc, 100.0, 30.0),
+            Some(later),
+            "the rest is the later box"
+        );
+    }
+
+    /// Hoisting must not release the clip: past the clipper the box is neither painted nor hit.
+    #[test]
+    fn a_fixed_box_hoisted_past_a_clip_is_not_hit_outside_it() {
+        let (mut doc, body) = page();
+        let clipper = append(&mut doc, body, CLIPPER);
+        let fixed = append(
+            &mut doc,
+            clipper,
+            "position:fixed;left:10px;top:80px;width:50px;height:50px",
+        );
+        doc.resolve(0.0);
+
+        assert_eq!(hit(&doc, 20.0, 90.0), Some(fixed), "inside the clip");
+        assert_ne!(hit(&doc, 20.0, 110.0), Some(fixed), "past the clip");
+    }
+
+    /// The clip is the scroll container's box, which stays put while its content scrolls.
+    #[test]
+    fn the_clip_of_a_scrolled_container_stays_with_its_box() {
+        let (mut doc, body) = page();
+        let scroller = append(
+            &mut doc,
+            body,
+            "margin:50px;width:100px;height:100px;overflow:auto",
+        );
+        let fixed = append(
+            &mut doc,
+            scroller,
+            "position:fixed;left:60px;top:120px;width:40px;height:50px",
+        );
+        doc.resolve(0.0);
+        *doc.nodes[scroller].scroll_offset_mut() = Point { x: 0.0, y: 40.0 };
+        doc.resolve(0.0);
+
+        assert_eq!(
+            hit(&doc, 65.0, 140.0),
+            Some(fixed),
+            "inside the container's box"
+        );
+        assert_ne!(
+            hit(&doc, 65.0, 160.0),
+            Some(fixed),
+            "below the container's box"
+        );
+    }
+
+    /// Tree order among positioned boxes holds across the clip: a later positioned box inside
+    /// it covers an earlier fixed box outside it, and stays clipped.
+    #[test]
+    fn a_later_positioned_box_under_a_clip_stays_above_an_earlier_fixed_box() {
+        let (mut doc, body) = page();
+        append(
+            &mut doc,
+            body,
+            "position:fixed;left:0;top:0;width:100px;height:100px",
+        );
+        let clipper = append(&mut doc, body, CLIPPER);
+        let later = append(&mut doc, clipper, "position:relative;height:150px");
+        doc.resolve(0.0);
+
+        assert_eq!(
+            hit(&doc, 20.0, 20.0),
+            Some(later),
+            "the overlap is the later box"
+        );
+        assert!(
+            hoisted_clip(&doc, later).is_some(),
+            "it keeps the clipper's clip"
+        );
+    }
+
+    /// The other half of tree order: hoisting the fixed box must not lift it over a positioned
+    /// box after it under the same clip.
+    #[test]
+    fn a_later_positioned_sibling_under_a_clip_stays_above_the_fixed_box() {
+        let (mut doc, body) = page();
+        let clipper = append(&mut doc, body, CLIPPER);
+        let header = append(&mut doc, clipper, "height:20px");
+        let fixed = append(&mut doc, header, FIXED);
+        let later = append(&mut doc, clipper, "position:relative;height:80px");
+        doc.resolve(0.0);
+
+        assert_eq!(
+            hit(&doc, 20.0, 30.0),
+            Some(later),
+            "the overlap is the later box"
+        );
+        assert_eq!(
+            hit(&doc, 20.0, 15.0),
+            Some(fixed),
+            "the rest is the fixed box"
+        );
     }
 }
