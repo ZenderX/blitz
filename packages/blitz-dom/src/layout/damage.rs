@@ -493,10 +493,6 @@ impl BaseDocument {
         root: NodeId,
         is_clipped: bool,
     ) -> (taffy::Point<f32>, Option<taffy::Rect<f32>>, bool) {
-        let establishes_containing_block = |node: &Node| {
-            node.primary_styles()
-                .is_some_and(|style| establishes_fixed_containing_block(&style))
-        };
         let mut offset = taffy::Point::ZERO;
         // Kept less the offset carried so far, which moves every clip alike once complete.
         let mut clip: Option<taffy::Rect<f32>> = None;
@@ -509,7 +505,7 @@ impl BaseDocument {
             let scroll_offset = node.scroll_offset();
             offset.x += location.x - scroll_offset.x as f32;
             offset.y += location.y - scroll_offset.y as f32;
-            is_released &= !establishes_containing_block(node);
+            is_released &= !node.establishes_fixed_containing_block();
             if is_clipped && !is_released && node.clips_own_overflow() {
                 let padding_box = taffy::Rect {
                     left: location.x + layout.border.left - offset.x,
@@ -532,7 +528,8 @@ impl BaseDocument {
             top: clip.top + offset.y,
             bottom: clip.bottom + offset.y,
         });
-        let escapes_root_clip = is_released && !establishes_containing_block(&self.nodes[root]);
+        let escapes_root_clip =
+            is_released && !self.nodes[root].establishes_fixed_containing_block();
         (offset, clip, escapes_root_clip)
     }
 
@@ -778,9 +775,7 @@ impl BaseDocument {
 
             let children_hoisting = match self.nodes[node_id].primary_styles() {
                 _ if parent_stacking_context.is_none() => AutoZHoisting::All,
-                // Not yet a stacking context here: `contain`, `perspective`, `will-change`,
-                // and a `transform` until the second flush. A box hoisted past it would
-                // escape its containing block.
+                // May not be a stacking context yet, and a box hoisted past it would escape it.
                 Some(style) if establishes_fixed_containing_block(&style) => AutoZHoisting::None,
                 Some(style) if clips_to_rounded_corners(&style) => {
                     hoisting.min(AutoZHoisting::FixedOnly)

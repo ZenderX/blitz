@@ -257,6 +257,7 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                 y: self.initial_y - (viewport_scroll.y * self.scale),
             }),
             viewport_clip_rect,
+            None,
         );
 
         // Render debug overlay
@@ -307,6 +308,7 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
         node_id: NodeId,
         parent_style_transform: Affine,
         clip_rect: Rect,
+        enclosing_clip: Option<&ContentClip<'_>>,
     ) {
         if self.captured.contains(&node_id) && self.live_capture.get() != Some(node_id) {
             return;
@@ -502,6 +504,12 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                     .map(|f| f.expansion_rect())
                     .unwrap_or(Rect::ZERO);
 
+                let has_effect_layer = has_opacity || filter.is_some() || backdrop_filter.is_some();
+                let has_released_child = node
+                    .stacking_context
+                    .as_ref()
+                    .is_some_and(|context| context.children.iter().any(|c| c.escapes_context_clip));
+
                 let mut effect_layer_clip = border_box;
                 effect_layer_clip.x0 += filter_expansion_area.x0;
                 effect_layer_clip.y0 += filter_expansion_area.y0;
@@ -513,13 +521,21 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                     effect_layer_clip = region;
                 }
 
+                // Released children only occur under opacity: a filter is their containing block.
+                let (effect_layer_transform, effect_layer_clip) = if has_released_child {
+                    let origin = Vec2::new(self.initial_x, self.initial_y);
+                    (Affine::IDENTITY, clip_rect + origin)
+                } else {
+                    (cx.transform, effect_layer_clip)
+                };
+
                 // Opacity/Filter layer if box has opacity or a filter.
                 // Clipped to border-box as it needs to include the background and borders.
                 self.layer_manager.maybe_with_layer(
                     scene,
-                    has_opacity || filter.is_some() || backdrop_filter.is_some(),
+                    has_effect_layer,
                     opacity,
-                    cx.transform,
+                    effect_layer_transform,
                     &effect_layer_clip,
                     filter,
                     backdrop_filter,
@@ -566,10 +582,22 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                             None,
                             None,
                         );
+                        // A released child cannot leave a group layer or its containing block's clip.
+                        let has_group_layer =
+                            has_clip_path || mask_layer_pushed || has_effect_layer;
+                        let enclosing_clip = enclosing_clip.filter(|_| !has_group_layer);
                         let content_clip = ContentClip {
                             shape: clip,
                             transform: cx.transform,
                             unclipped_rect: clip_rect,
+                            enclosing: enclosing_clip,
+                        };
+                        let children_clip = if node.establishes_fixed_containing_block() {
+                            None
+                        } else if clip_layer_used {
+                            Some(&content_clip)
+                        } else {
+                            enclosing_clip
                         };
 
                         // Now that background has been drawn, offset pos and cx in order to draw our contents scrolled
@@ -594,12 +622,7 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                         cx.draw_inline_layout(scene, content_position);
                         cx.draw_marker(scene, content_position);
                         cx.draw_column_rules(scene);
-                        cx.draw_children(
-                            scene,
-                            cx.transform,
-                            child_clip_rect,
-                            clip_layer_used.then_some(&content_clip),
-                        );
+                        cx.draw_children(scene, cx.transform, child_clip_rect, children_clip);
                         self.layer_manager.maybe_pop_layer(scene, clip_layer_used);
 
                         // Overlay scrollbars, drawn unscrolled above the
@@ -629,13 +652,18 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
         node_id: NodeId,
         parent_style_transform: Affine,
         clip_rect: Rect,
+        enclosing_clip: Option<&ContentClip<'_>>,
     ) {
         let node = &self.dom.as_ref().tree()[node_id];
 
         match &node.data {
-            NodeData::Element(_) | NodeData::AnonymousBlock(_) => {
-                self.render_element(scene, node_id, parent_style_transform, clip_rect)
-            }
+            NodeData::Element(_) | NodeData::AnonymousBlock(_) => self.render_element(
+                scene,
+                node_id,
+                parent_style_transform,
+                clip_rect,
+                enclosing_clip,
+            ),
             NodeData::Text(TextNodeData { .. }) => {
                 // Text nodes should never be rendered directly
                 // (they should always be rendered as part of an inline layout)
@@ -724,16 +752,40 @@ fn to_peniko_image(image: &RasterImageData, quality: peniko::ImageQuality) -> pe
     }
 }
 
-/// A context of loaded and hot data to draw the element from
-/// The overflow clip layer a stacking context draws its contents in, which a hoisted child
-/// released from that clip steps out of while it draws.
-struct ContentClip<'a> {
+/// An overflow clip layer open around the content being drawn, which a hoisted child released
+/// from it steps out of while it draws.
+pub(crate) struct ContentClip<'a> {
     shape: &'a kurbo::BezPath,
     transform: Affine,
-    /// The cull rectangle the context inherited, unnarrowed by its own clip.
+    /// The cull rectangle the clip's box inherited, unnarrowed by this clip.
     unclipped_rect: Rect,
+    /// The clip layer directly around this one, when only clip layers lie between them and
+    /// the box's containing block is above it.
+    enclosing: Option<&'a ContentClip<'a>>,
 }
 
+impl ContentClip<'_> {
+    fn step_out(&self, scene: &mut impl PaintScene) {
+        scene.pop_layer();
+        if let Some(enclosing) = self.enclosing {
+            enclosing.step_out(scene);
+        }
+    }
+
+    fn step_back_in(&self, scene: &mut impl PaintScene) {
+        if let Some(enclosing) = self.enclosing {
+            enclosing.step_back_in(scene);
+        }
+        scene.push_clip_layer(self.transform, self.shape);
+    }
+
+    fn outermost_unclipped_rect(&self) -> Rect {
+        self.enclosing
+            .map_or(self.unclipped_rect, ContentClip::outermost_unclipped_rect)
+    }
+}
+
+/// A context of loaded and hot data to draw the element from
 struct ElementCx<'dom, 'a> {
     context: &'dom BlitzDomPainter<'dom, 'a>,
     frame: CssBox,
@@ -1189,7 +1241,13 @@ impl ElementCx<'_, '_> {
         // Regular children
         if let Some(children) = &*self.node.paint_children.borrow() {
             for child_id in children {
-                self.render_node(scene, *child_id, parent_style_transform, clip_rect);
+                self.render_node(
+                    scene,
+                    *child_id,
+                    parent_style_transform,
+                    clip_rect,
+                    content_clip,
+                );
             }
         }
 
@@ -1208,8 +1266,8 @@ impl ElementCx<'_, '_> {
     }
 
     /// Draw a hoisted child at its `position`, inside the clip of the boxes it was hoisted
-    /// past; one whose containing block lies above the stacking context steps out of that
-    /// context's `content_clip` meanwhile, staying in its group effects.
+    /// past; one whose containing block lies above the stacking context steps out of the
+    /// `content_clip` chain meanwhile, staying in its group effects.
     fn draw_hoisted_child(
         &self,
         scene: &mut impl PaintScene,
@@ -1218,11 +1276,11 @@ impl ElementCx<'_, '_> {
         clip_rect: Rect,
         content_clip: Option<&ContentClip<'_>>,
     ) {
-        let content_clip = content_clip.filter(|_| child.escapes_context_clip);
-        if content_clip.is_some() {
-            scene.pop_layer();
+        let released_clip = content_clip.filter(|_| child.escapes_context_clip);
+        if let Some(released_clip) = released_clip {
+            released_clip.step_out(scene);
         }
-        let clip_rect = content_clip.map_or(clip_rect, |clip| clip.unclipped_rect);
+        let clip_rect = released_clip.map_or(clip_rect, ContentClip::outermost_unclipped_rect);
 
         let pos = kurbo::Vec2 {
             x: child.position.x as f64 * self.scale,
@@ -1236,6 +1294,8 @@ impl ElementCx<'_, '_> {
                 clip.bottom as f64 * self.scale,
             )
         });
+        // A descendant can step out only of clip layers still open directly around it.
+        let open_clip = content_clip.filter(|_| released_clip.is_none() && clip.is_none());
         self.layer_manager.maybe_with_layer(
             scene,
             clip.is_some(),
@@ -1250,12 +1310,13 @@ impl ElementCx<'_, '_> {
                     child.node_id,
                     parent_style_transform.pre_translate(pos),
                     clip_rect,
+                    open_clip,
                 )
             },
         );
 
-        if let Some(content_clip) = content_clip {
-            scene.push_clip_layer(content_clip.transform, content_clip.shape);
+        if let Some(released_clip) = released_clip {
+            released_clip.step_back_in(scene);
         }
     }
 

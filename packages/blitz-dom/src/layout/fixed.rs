@@ -31,7 +31,7 @@ use style::values::specified::box_::{Contain, DisplayOutside, WillChangeBits};
 /// descendants: `transform` (or `translate`/`rotate`/`scale`), `perspective`, `filter` or
 /// `backdrop-filter` other than none, `contain: paint | layout | strict | content`, or a
 /// `will-change` naming one.
-pub(super) fn establishes_fixed_containing_block(style: &ComputedValues) -> bool {
+pub(crate) fn establishes_fixed_containing_block(style: &ComputedValues) -> bool {
     let box_style = style.get_box();
     let effects = style.get_effects();
     !box_style.transform.0.is_empty()
