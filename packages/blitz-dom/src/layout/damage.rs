@@ -355,20 +355,48 @@ impl HoistedPaintChildren {
     }
 
     pub fn compute_content_size(&mut self, doc: &BaseDocument) {
+        fn union(a: Rect<f32>, b: Rect<f32>) -> Rect<f32> {
+            taffy::Rect {
+                left: a.left.min(b.left),
+                top: a.top.min(b.top),
+                right: a.right.max(b.right),
+                bottom: a.bottom.max(b.bottom),
+            }
+        }
+
         fn child_pos(child: &HoistedPaintChild, doc: &BaseDocument) -> Rect<f32> {
-            let layout = doc.nodes[child.node_id].final_layout();
+            let node = &doc.nodes[child.node_id];
+            let layout = node.final_layout();
             let left = child.position.x + layout.location.x;
             let top = child.position.y + layout.location.y;
             let overflow = layout.scrollable_overflow_rect;
             let right = left + layout.size.width.max(overflow.right);
             let bottom = top + layout.size.height.max(overflow.bottom);
-
-            taffy::Rect {
+            let own_area = taffy::Rect {
                 top,
                 left,
                 bottom,
                 right,
-            }
+            };
+
+            // A box hoisted within the child can lie past every box around it.
+            let nested = node.stacking_context.as_ref();
+            let Some(nested) = nested.filter(|nested| !nested.children.is_empty()) else {
+                return own_area;
+            };
+            let (origin_x, origin_y) = (
+                left - node.scroll_offset().x as f32,
+                top - node.scroll_offset().y as f32,
+            );
+            union(
+                own_area,
+                taffy::Rect {
+                    left: nested.content_area.left + origin_x,
+                    top: nested.content_area.top + origin_y,
+                    right: nested.content_area.right + origin_x,
+                    bottom: nested.content_area.bottom + origin_y,
+                },
+            )
         }
 
         if self.children.is_empty() {
@@ -376,11 +404,7 @@ impl HoistedPaintChildren {
         } else {
             self.content_area = child_pos(&self.children[0], doc);
             for child in self.children[1..].iter() {
-                let pos = child_pos(child, doc);
-                self.content_area.left = self.content_area.left.min(pos.left);
-                self.content_area.top = self.content_area.top.min(pos.top);
-                self.content_area.right = self.content_area.right.max(pos.right);
-                self.content_area.bottom = self.content_area.bottom.max(pos.bottom);
+                self.content_area = union(self.content_area, child_pos(child, doc));
             }
         }
     }
@@ -461,13 +485,18 @@ impl BaseDocument {
     }
 
     /// Set the position and content area of every hoisted child from the finished layout.
-    /// The hoisting itself runs in the style flush, before that layout is known.
+    /// The hoisting itself runs in the style flush, before that layout is known. Descendants
+    /// go first, as a content area spans those of the contexts hoisted into it.
     pub(crate) fn place_hoisted_children(&mut self) {
         let mut stack = vec![self.root_element().id];
+        let mut preorder = Vec::new();
         while let Some(id) = stack.pop() {
+            preorder.push(id);
             if let Some(children) = self.nodes[id].layout_children.borrow().as_ref() {
                 stack.extend(children.iter().copied());
             }
+        }
+        for id in preorder.into_iter().rev() {
             let Some(mut context) = self.nodes[id].stacking_context.take() else {
                 continue;
             };
