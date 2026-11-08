@@ -7,15 +7,16 @@
 //! out every fixed box against its real containing block. The box stays in its layout
 //! parent's frame, so painting and hit-testing read the corrected rects unchanged.
 //!
-//! A fixed box whose containing block is the viewport does not move with viewport scroll,
-//! nor with the scroll of an ancestor scroll container. As for sticky boxes (see
-//! `sticky.rs`), a pass after rounding adds those scroll offsets to its `final_layout`
-//! location, so painting and hit-testing, which subtract them, leave it in place; a scroll,
-//! which sets no damage, is picked up by the next `resolve`. The box then lies outside what
-//! its ancestors stored for hit-testing to prune on, so the pass widens that too.
+//! A fixed box does not move with the scroll of an ancestor strictly between it and its
+//! containing block, nor, when that is the viewport, with viewport scroll. As for sticky
+//! boxes (see `sticky.rs`), a pass after rounding adds those scroll offsets to its
+//! `final_layout` location, so painting and hit-testing, which subtract them, leave it in
+//! place; a scroll, which sets no damage, is picked up by the next `resolve`. The box then
+//! lies outside what its ancestors stored for hit-testing to prune on, so the pass widens
+//! that too.
 //!
 //! Nor does it move with an ancestor's sticky shift: the sticky pass takes that back from
-//! it. The box stays clipped by an ancestor scroll container.
+//! it. Overflow clips it only from its containing block upward (CSS 2.1 §11.1.1).
 
 use crate::layout::inline::layout_abspos_child;
 use crate::node::Node;
@@ -27,17 +28,19 @@ use style::values::generics::transform::{Scale, Translate};
 use style::values::specified::box_::{Contain, DisplayOutside, WillChangeBits};
 
 /// Whether a box of this style is the containing block for its `position: fixed`
-/// descendants: `transform` (or `translate`/`rotate`/`scale`), `perspective` or `filter`
-/// other than none, `contain: paint | layout | strict | content`, or a `will-change` naming
-/// one.
+/// descendants: `transform` (or `translate`/`rotate`/`scale`), `perspective`, `filter` or
+/// `backdrop-filter` other than none, `contain: paint | layout | strict | content`, or a
+/// `will-change` naming one.
 pub(super) fn establishes_fixed_containing_block(style: &ComputedValues) -> bool {
     let box_style = style.get_box();
+    let effects = style.get_effects();
     !box_style.transform.0.is_empty()
         || !matches!(box_style.translate, Translate::None)
         || !matches!(box_style.rotate, Rotate::None)
         || !matches!(box_style.scale, Scale::None)
         || !matches!(box_style.perspective, Perspective::None)
-        || !style.get_effects().filter.0.is_empty()
+        || !effects.filter.0.is_empty()
+        || !effects.backdrop_filter.0.is_empty()
         || box_style
             .contain
             .intersects(Contain::LAYOUT | Contain::PAINT)
@@ -49,7 +52,7 @@ pub(super) fn establishes_fixed_containing_block(style: &ComputedValues) -> bool
         )
 }
 
-fn is_fixed_positioned(node: &Node) -> bool {
+pub(super) fn is_fixed_positioned(node: &Node) -> bool {
     node.primary_styles()
         .is_some_and(|style| matches!(style.clone_position(), Position::Fixed))
 }
@@ -71,9 +74,7 @@ impl BaseDocument {
     /// Re-lay out every `position: fixed` box against its containing block. Runs between
     /// the taffy layout and rounding. Idempotent: the static position of an axis without
     /// insets is recovered from the box's current location, which is also the output.
-    /// Returns the boxes for [`Self::scroll_fixed_boxes`] to shift: those whose containing
-    /// block is the viewport, having no containing block for fixed boxes among their
-    /// ancestors.
+    /// Returns the boxes, for [`Self::scroll_fixed_boxes`] to shift.
     pub(crate) fn layout_fixed_boxes(&mut self) -> Vec<NodeId> {
         let viewport = self.stylist.device().au_viewport_size();
         let viewport = taffy::Size {
@@ -83,43 +84,30 @@ impl BaseDocument {
 
         // Pre-order, so a fixed box nested in another is placed after its ancestor.
         let mut fixed_boxes = Vec::new();
-        let mut scrolled_boxes = Vec::new();
-        let mut stack = vec![(self.root_element().id, false)];
-        while let Some((id, is_in_containing_block)) = stack.pop() {
+        let mut stack = vec![self.root_element().id];
+        while let Some(id) = stack.pop() {
             let Some(node) = self.nodes.get(id) else {
                 continue;
             };
             if let Some(children) = node.layout_children.borrow().as_ref() {
-                let child_is_in_containing_block = is_in_containing_block
-                    || node
-                        .primary_styles()
-                        .is_some_and(|style| establishes_fixed_containing_block(&style));
-                stack.extend(
-                    children
-                        .iter()
-                        .rev()
-                        .map(|&child| (child, child_is_in_containing_block)),
-                );
+                stack.extend(children.iter().rev());
             }
             if is_fixed_positioned(node) {
                 fixed_boxes.push(id);
-                if !is_in_containing_block {
-                    scrolled_boxes.push(id);
-                }
             }
         }
 
-        for id in fixed_boxes {
+        for &id in &fixed_boxes {
             self.layout_fixed_box(id, viewport);
         }
-        scrolled_boxes
+        fixed_boxes
     }
 
     /// Cancel, for each of `boxes`, the scroll offsets it would otherwise move with: those
-    /// of its ancestors up to and including the nearest fixed one, which any box inside
-    /// moves with, or else up to the root and the viewport's. Runs after rounding, so each
-    /// box starts from its unscrolled position, and before the sticky pass, so a sticky box
-    /// inside one measures from where it is.
+    /// of its ancestors below its containing block, which carries it, up to and including
+    /// the nearest fixed one, which any box inside moves with, or else up to the root and
+    /// the viewport's. Runs after rounding, so each box starts from its unscrolled position,
+    /// and before the sticky pass, so a sticky box inside one measures from where it is.
     pub(crate) fn scroll_fixed_boxes(&mut self, boxes: &[NodeId]) {
         for &id in boxes {
             let scroll = self.carried_scroll(id);
@@ -131,12 +119,19 @@ impl BaseDocument {
     }
 
     /// The scroll offsets painting and hit-testing apply to a box from its ancestors, up to
-    /// the nearest fixed ancestor, or else up to and including the viewport.
+    /// and excluding its containing block, up to the nearest fixed ancestor, or else up to
+    /// and including the viewport.
     fn carried_scroll(&self, id: NodeId) -> crate::Point<f64> {
         let mut scroll = crate::Point { x: 0.0, y: 0.0 };
         let mut current = id;
         while let Some(parent_id) = self.nodes[current].layout_parent.get() {
             let parent = &self.nodes[parent_id];
+            if parent
+                .primary_styles()
+                .is_some_and(|style| establishes_fixed_containing_block(&style))
+            {
+                return scroll;
+            }
             scroll.x += parent.scroll_offset().x;
             scroll.y += parent.scroll_offset().y;
             if is_fixed_positioned(parent) {
@@ -174,8 +169,9 @@ impl BaseDocument {
 
     /// Hit-testing prunes a subtree on what its root stored, and no damage recomputes that
     /// for a scroll. So each ancestor's stored overflow grows to cover the box wherever a
-    /// scroll puts it, and never shrinks for one: a wider rect only prunes less. No ancestor
-    /// up to the root has a transform, or the box would not be shifted.
+    /// scroll puts it, and never shrinks for one: a wider rect only prunes less. Each step
+    /// goes through that ancestor's transform, so a transformed containing block is covered
+    /// too; a transform not resolved yet leaves its box damaged, which recomputes the rect.
     fn widen_ancestors_to(&mut self, id: NodeId) {
         let mut current = id;
         while let Some(parent_id) = self.nodes[current].layout_parent.get() {
@@ -313,6 +309,23 @@ mod tests {
         assert_eq!(position(&doc, fixed), (80.0, 70.0));
     }
 
+    /// Filter Effects 2: `backdrop-filter` is a containing block for fixed descendants, while
+    /// `clip-path` and `mask-image` are not.
+    #[test]
+    fn fixed_box_is_placed_against_a_backdrop_filter_ancestor() {
+        let placed_at = |effect: &str| {
+            let wrapper = format!("margin:50px;width:100px;height:100px;{effect}");
+            let (doc, _, fixed) = layout(&wrapper, FIXED);
+            position(&doc, fixed)
+        };
+        assert_eq!(placed_at("backdrop-filter:blur(1px)"), (80.0, 70.0));
+        assert_eq!(placed_at("clip-path:inset(0)"), (30.0, 20.0));
+        assert_eq!(
+            placed_at("mask-image:linear-gradient(black,black)"),
+            (30.0, 20.0)
+        );
+    }
+
     #[test]
     fn fixed_box_insets_resolve_against_the_viewport() {
         let (doc, _, fixed) = layout(
@@ -421,7 +434,6 @@ mod tests {
     }
 
     const SCROLLER: &str = "margin:50px;width:100px;height:100px;overflow:auto";
-    /// Inside [`SCROLLER`]'s padding box, so the container's clip leaves it visible.
     const FIXED_IN_SCROLLER: &str = "position:fixed;left:60px;top:70px;width:40px;height:30px";
 
     #[test]
@@ -478,5 +490,109 @@ mod tests {
 
         scroll_to(&mut doc, 0.0);
         assert_eq!(doc.hit(35.0, 25.0).map(|hit| hit.node_id), Some(fixed));
+    }
+
+    /// As [`layout`], with a box of style `{middle}` between the wrapper and the fixed box;
+    /// returns the document, the wrapper, the middle box and the fixed box.
+    fn layout_with_middle(
+        wrapper: &str,
+        middle: &str,
+        fixed: &str,
+    ) -> (BaseDocument, NodeId, NodeId, NodeId) {
+        let (mut doc, wrapper_id, middle_id) = layout(wrapper, &format!("display:block;{middle}"));
+        let mut mutator = doc.mutate();
+        let fixed_id = mutator.create_element(
+            qual_name!("div"),
+            vec![Attribute {
+                name: qual_name!("style"),
+                value: fixed.to_string(),
+            }],
+        );
+        mutator.append_children(middle_id, &[fixed_id]);
+        drop(mutator);
+        doc.resolve(0.0);
+        (doc, wrapper_id, middle_id, fixed_id)
+    }
+
+    const FIXED_IN_TRANSFORMED: &str = "position:fixed;left:10px;top:60px;width:40px;height:30px";
+
+    /// Chrome and Firefox keep a fixed box's scroll state at its containing block, so a
+    /// scroller inside that block does not reach it.
+    #[test]
+    fn fixed_box_under_a_transform_stays_put_when_a_scroller_inside_it_scrolls() {
+        let (mut doc, _, scroller, fixed) = layout_with_middle(
+            "margin:50px;width:150px;height:150px;transform:translate(1px,0)",
+            "width:100px;height:100px;overflow:auto",
+            FIXED_IN_TRANSFORMED,
+        );
+        assert_eq!(doc.hit(65.0, 115.0).map(|hit| hit.node_id), Some(fixed));
+
+        scroll_container_to(&mut doc, scroller, 40.0);
+        assert_eq!(position(&doc, fixed), (60.0, 110.0), "scroll cancelled");
+        assert_eq!(doc.hit(65.0, 115.0).map(|hit| hit.node_id), Some(fixed));
+        assert_eq!(
+            doc.hit(65.0, 75.0).map(|hit| hit.node_id),
+            Some(scroller),
+            "where the scroll would have carried it, only the scroller is hit"
+        );
+
+        scroll_container_to(&mut doc, scroller, 40.0);
+        assert_eq!(position(&doc, fixed), (60.0, 110.0), "repeat resolves hold");
+    }
+
+    /// WPT `transform-containing-block-and-scrolling-area-for-fixed`: the containing block
+    /// scrolls its fixed descendants like any other content.
+    #[test]
+    fn fixed_box_moves_with_the_scroll_of_its_transformed_containing_block() {
+        let (mut doc, containing_block, _, fixed) = layout_with_middle(
+            "margin:50px;width:150px;height:150px;overflow:auto;transform:translate(1px,0)",
+            "width:100px;height:100px",
+            FIXED_IN_TRANSFORMED,
+        );
+        scroll_container_to(&mut doc, containing_block, 40.0);
+        assert_eq!(position(&doc, fixed), (60.0, 70.0), "nothing cancelled");
+        assert_eq!(doc.hit(65.0, 75.0).map(|hit| hit.node_id), Some(fixed));
+    }
+
+    fn resize_window(doc: &mut BaseDocument, width: u32, height: u32) {
+        doc.set_viewport(Viewport::new(width, height, 1.0, ColorScheme::Light));
+        doc.resolve(0.0);
+    }
+
+    /// A window resize moves a box with a right or bottom inset, without resizing it or its
+    /// parent, so no overflow damage reaches the parent to recompute what it stored.
+    #[test]
+    fn stored_overflow_follows_a_viewport_fixed_box_moved_by_a_window_resize() {
+        let (mut doc, wrapper, fixed) = layout(
+            "margin:50px;width:100px;height:100px",
+            "position:fixed;right:10px;bottom:10px;width:40px;height:30px",
+        );
+        resize_window(&mut doc, 800, 600);
+        assert_eq!(position(&doc, fixed), (750.0, 560.0));
+
+        let stored = *doc.nodes[wrapper].scrollable_overflow();
+        assert_eq!(
+            (stored.x1, stored.y1),
+            (740.0, 540.0),
+            "in the wrapper's frame"
+        );
+        assert_eq!(doc.hit(755.0, 565.0).map(|hit| hit.node_id), Some(fixed));
+    }
+
+    /// The containing block resizes and is damaged, but a box between it and the fixed box
+    /// is not, so it needs the widening too.
+    #[test]
+    fn stored_overflow_follows_a_fixed_box_moved_by_its_containing_block_resizing() {
+        let (mut doc, _, middle, fixed) = layout_with_middle(
+            "margin:50px;width:50%;height:100px;transform:translate(1px,0)",
+            "width:10px;height:10px",
+            "position:fixed;right:10px;top:0;width:40px;height:30px",
+        );
+        assert_eq!(position(&doc, fixed), (200.0, 50.0));
+        resize_window(&mut doc, 800, 300);
+        assert_eq!(position(&doc, fixed), (400.0, 50.0));
+
+        let stored = *doc.nodes[middle].scrollable_overflow();
+        assert_eq!(stored.x1, 390.0, "in the middle box's frame");
     }
 }

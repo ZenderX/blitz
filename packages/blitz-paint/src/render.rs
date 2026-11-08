@@ -22,8 +22,8 @@ use crate::text::DrawTextContext;
 use crate::{CustomWidgetSceneMap, SELECTION_COLOR};
 use anyrender::{PaintScene, Scene};
 use blitz_dom::node::{
-    LayoutFlow, ListItemLayout, ListItemLayoutPosition, Marker, NodeData, RasterImageData,
-    SpecialElementData, TextBrush, TextInputData, TextNodeData,
+    HoistedPaintChild, LayoutFlow, ListItemLayout, ListItemLayoutPosition, Marker, NodeData,
+    RasterImageData, SpecialElementData, TextBrush, TextInputData, TextNodeData,
 };
 use blitz_dom::{BaseDocument, ElementData, Node, NodeId, local_name};
 use blitz_traits::devtools::DevtoolSettings;
@@ -374,8 +374,9 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                 || is_sub_doc
                 || is_text_input
                 || contain_paint
-                || !matches!(overflow_x, Overflow::Visible)
-                || !matches!(overflow_y, Overflow::Visible));
+                || (!node.is_overflow_propagated_body()
+                    && (!matches!(overflow_x, Overflow::Visible)
+                        || !matches!(overflow_y, Overflow::Visible))));
 
         // Apply padding/border offset to inline root
         let taffy::Layout {
@@ -556,7 +557,7 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                         };
 
                         // Clip layer if box requires clipping. Opacity set to 1.0
-                        self.layer_manager.maybe_with_layer(
+                        let clip_layer_used = self.layer_manager.maybe_push_layer(
                             scene,
                             should_clip,
                             1.0, // opacity
@@ -564,32 +565,42 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                             clip,
                             None,
                             None,
-                            |scene| {
-                                // Now that background has been drawn, offset pos and cx in order to draw our contents scrolled
-                                let content_position = Point {
-                                    x: content_position.x - node.scroll_offset().x,
-                                    y: content_position.y - node.scroll_offset().y,
-                                };
-
-                                cx.transform = cx.transform.then_translate(Vec2 {
-                                    x: -node.scroll_offset().x * self.scale,
-                                    y: -node.scroll_offset().y * self.scale,
-                                });
-                                cx.draw_image(scene);
-                                #[cfg(feature = "svg")]
-                                cx.draw_svg(scene);
-                                #[cfg(feature = "custom-widget")]
-                                cx.draw_custom_widget(scene);
-                                cx.draw_sub_document(scene);
-                                cx.draw_input(scene);
-                                cx.draw_select(scene);
-                                cx.draw_text_input_text(scene, content_position);
-                                cx.draw_inline_layout(scene, content_position);
-                                cx.draw_marker(scene, content_position);
-                                cx.draw_column_rules(scene);
-                                cx.draw_children(scene, cx.transform, child_clip_rect);
-                            },
                         );
+                        let content_clip = ContentClip {
+                            shape: clip,
+                            transform: cx.transform,
+                            unclipped_rect: clip_rect,
+                        };
+
+                        // Now that background has been drawn, offset pos and cx in order to draw our contents scrolled
+                        let content_position = Point {
+                            x: content_position.x - node.scroll_offset().x,
+                            y: content_position.y - node.scroll_offset().y,
+                        };
+
+                        cx.transform = cx.transform.then_translate(Vec2 {
+                            x: -node.scroll_offset().x * self.scale,
+                            y: -node.scroll_offset().y * self.scale,
+                        });
+                        cx.draw_image(scene);
+                        #[cfg(feature = "svg")]
+                        cx.draw_svg(scene);
+                        #[cfg(feature = "custom-widget")]
+                        cx.draw_custom_widget(scene);
+                        cx.draw_sub_document(scene);
+                        cx.draw_input(scene);
+                        cx.draw_select(scene);
+                        cx.draw_text_input_text(scene, content_position);
+                        cx.draw_inline_layout(scene, content_position);
+                        cx.draw_marker(scene, content_position);
+                        cx.draw_column_rules(scene);
+                        cx.draw_children(
+                            scene,
+                            cx.transform,
+                            child_clip_rect,
+                            clip_layer_used.then_some(&content_clip),
+                        );
+                        self.layer_manager.maybe_pop_layer(scene, clip_layer_used);
 
                         // Overlay scrollbars, drawn unscrolled above the
                         // clipped content.
@@ -714,6 +725,15 @@ fn to_peniko_image(image: &RasterImageData, quality: peniko::ImageQuality) -> pe
 }
 
 /// A context of loaded and hot data to draw the element from
+/// The overflow clip layer a stacking context draws its contents in, which a hoisted child
+/// released from that clip steps out of while it draws.
+struct ContentClip<'a> {
+    shape: &'a kurbo::BezPath,
+    transform: Affine,
+    /// The cull rectangle the context inherited, unnarrowed by its own clip.
+    unclipped_rect: Rect,
+}
+
 struct ElementCx<'dom, 'a> {
     context: &'dom BlitzDomPainter<'dom, 'a>,
     frame: CssBox,
@@ -1150,6 +1170,7 @@ impl ElementCx<'_, '_> {
         scene: &mut impl PaintScene,
         parent_style_transform: Affine,
         clip_rect: Rect,
+        content_clip: Option<&ContentClip<'_>>,
     ) {
         // Negative z_index hoisted nodes
 
@@ -1157,11 +1178,10 @@ impl ElementCx<'_, '_> {
             for hoisted_child in hoisted.neg_z_hoisted_children() {
                 self.draw_hoisted_child(
                     scene,
-                    hoisted_child.node_id,
-                    hoisted_child.position,
-                    hoisted_child.clip,
+                    hoisted_child,
                     parent_style_transform,
                     clip_rect,
+                    content_clip,
                 );
             }
         }
@@ -1178,31 +1198,37 @@ impl ElementCx<'_, '_> {
             for hoisted_child in hoisted.pos_z_hoisted_children() {
                 self.draw_hoisted_child(
                     scene,
-                    hoisted_child.node_id,
-                    hoisted_child.position,
-                    hoisted_child.clip,
+                    hoisted_child,
                     parent_style_transform,
                     clip_rect,
+                    content_clip,
                 );
             }
         }
     }
 
-    /// Draw a hoisted child at `position`, inside the clip of the boxes it was hoisted past.
+    /// Draw a hoisted child at its `position`, inside the clip of the boxes it was hoisted
+    /// past; one whose containing block lies above the stacking context steps out of that
+    /// context's `content_clip` meanwhile, staying in its group effects.
     fn draw_hoisted_child(
         &self,
         scene: &mut impl PaintScene,
-        node_id: NodeId,
-        position: taffy::Point<f32>,
-        clip: Option<taffy::Rect<f32>>,
+        child: &HoistedPaintChild,
         parent_style_transform: Affine,
         clip_rect: Rect,
+        content_clip: Option<&ContentClip<'_>>,
     ) {
+        let content_clip = content_clip.filter(|_| child.escapes_context_clip);
+        if content_clip.is_some() {
+            scene.pop_layer();
+        }
+        let clip_rect = content_clip.map_or(clip_rect, |clip| clip.unclipped_rect);
+
         let pos = kurbo::Vec2 {
-            x: position.x as f64 * self.scale,
-            y: position.y as f64 * self.scale,
+            x: child.position.x as f64 * self.scale,
+            y: child.position.y as f64 * self.scale,
         };
-        let clip = clip.map(|clip| {
+        let clip = child.clip.map(|clip| {
             Rect::new(
                 clip.left as f64 * self.scale,
                 clip.top as f64 * self.scale,
@@ -1221,12 +1247,16 @@ impl ElementCx<'_, '_> {
             |scene| {
                 self.render_node(
                     scene,
-                    node_id,
+                    child.node_id,
                     parent_style_transform.pre_translate(pos),
                     clip_rect,
                 )
             },
         );
+
+        if let Some(content_clip) = content_clip {
+            scene.push_clip_layer(content_clip.transform, content_clip.shape);
+        }
     }
 
     #[cfg(feature = "svg")]

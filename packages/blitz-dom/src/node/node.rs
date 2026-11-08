@@ -1,4 +1,5 @@
 use crate::Document;
+pub use crate::layout::damage::HoistedPaintChild;
 use crate::layout::damage::HoistedPaintChildren;
 use bitflags::bitflags;
 use blitz_traits::events::{
@@ -28,6 +29,8 @@ use style::shared_lock::SharedRwLock;
 use style::stylesheets::UrlExtraData;
 use style::values::computed::CSSPixelLength;
 use style::values::computed::Display as StyloDisplay;
+use style::values::computed::basic_shape::ClipPath;
+use style::values::generics::image::Image as StyloImage;
 use style::values::specified::box_::{DisplayInside, DisplayOutside};
 use style_dom::ElementState;
 use style_traits::values::ToCss;
@@ -1174,10 +1177,21 @@ impl Node {
             return true;
         }
 
+        let effects = style.get_effects();
+        if !effects.filter.0.is_empty()
+            || !effects.backdrop_filter.0.is_empty()
+            || !matches!(style.clone_clip_path(), ClipPath::None)
+            || style
+                .get_svg()
+                .mask_image
+                .0
+                .iter()
+                .any(|image| !matches!(image, StyloImage::None))
+        {
+            return true;
+        }
+
         // TODO: mix-blend-mode
-        // TODO: filter
-        // TODO: clip-path
-        // TODO: mask
         // TODO: isolation
         // TODO: contain
 
@@ -1250,10 +1264,10 @@ impl Node {
         let matches_hoisted_content = match &self.stacking_context {
             Some(sc) => {
                 let content_area = sc.content_area;
-                x >= content_area.left + self.scroll_offset().x as f32
-                    && x <= content_area.right + self.scroll_offset().x as f32
-                    && y >= content_area.top + self.scroll_offset().y as f32
-                    && y <= content_area.bottom + self.scroll_offset().y as f32
+                x >= content_area.left
+                    && x <= content_area.right
+                    && y >= content_area.top
+                    && y <= content_area.bottom
             }
             None => false,
         };
@@ -1270,6 +1284,17 @@ impl Node {
         if !matches_self && !matches_content && !matches_hoisted_content && !matches_overflow {
             return None;
         }
+
+        // In the frame `x` and `y` are in here, scrolled but before the inline root offset.
+        let is_outside_own_clip = self.clips_own_overflow() && {
+            let layout = self.final_layout();
+            let (scroll_x, scroll_y) =
+                (self.scroll_offset().x as f32, self.scroll_offset().y as f32);
+            x < layout.border.left + scroll_x
+                || x > layout.size.width - layout.border.right + scroll_x
+                || y < layout.border.top + scroll_y
+                || y > layout.size.height - layout.border.bottom + scroll_y
+        };
 
         // Descendants overwrite, so the innermost scroll container's thumb
         // wins. Thumb coords are border-box relative (unscrolled).
@@ -1295,7 +1320,9 @@ impl Node {
         if matches_hoisted_content {
             if let Some(hoisted) = &self.stacking_context {
                 for hoisted_child in hoisted.pos_z_hoisted_children().rev() {
-                    if !hoisted_child.is_visible_at(x, y) {
+                    if !hoisted_child.is_visible_at(x, y)
+                        || (is_outside_own_clip && !hoisted_child.escapes_context_clip)
+                    {
                         continue;
                     }
                     let x = x - hoisted_child.position.x;
@@ -1321,6 +1348,9 @@ impl Node {
         if matches_hoisted_content {
             if let Some(hoisted) = &self.stacking_context {
                 for hoisted_child in hoisted.neg_z_hoisted_children().rev() {
+                    if is_outside_own_clip && !hoisted_child.escapes_context_clip {
+                        continue;
+                    }
                     let x = x - hoisted_child.position.x;
                     let y = y - hoisted_child.position.y;
                     if let Some(hit) = self
@@ -1372,6 +1402,33 @@ impl Node {
         }
 
         None
+    }
+
+    /// Whether this is the `<body>` whose overflow the viewport takes, the root element's
+    /// being visible in both axes (CSS Overflow 3 §3.1.4); it then clips nothing itself.
+    pub fn is_overflow_propagated_body(&self) -> bool {
+        self.data.is_element_with_tag_name(&local_name!("body"))
+            && self.parent.is_some_and(|parent_id| {
+                let root = self.with(parent_id);
+                let overflow = root.style().overflow;
+                root.is_root_element()
+                    && overflow.x == taffy::Overflow::Visible
+                    && overflow.y == taffy::Overflow::Visible
+            })
+    }
+
+    fn is_root_element(&self) -> bool {
+        self.parent
+            .is_some_and(|parent_id| matches!(self.with(parent_id).data, NodeData::Document(_)))
+    }
+
+    /// Whether this box clips its overflow itself, as every box does but the root element
+    /// and a `<body>` whose overflow belongs to the viewport.
+    pub fn clips_own_overflow(&self) -> bool {
+        let overflow = self.style().overflow;
+        (overflow.x != taffy::Overflow::Visible || overflow.y != taffy::Overflow::Visible)
+            && !self.is_root_element()
+            && !self.is_overflow_propagated_body()
     }
 
     /// Find the inline root ancestor of this node (or self if this is an inline root).
