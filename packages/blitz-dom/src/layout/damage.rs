@@ -1,7 +1,7 @@
 use blitz_traits::node_id::NodeId;
 use std::ops::Range;
 
-use super::fixed::establishes_fixed_containing_block;
+use super::fixed::{establishes_fixed_containing_block, is_fixed_positioned};
 use super::writing_mode;
 use crate::Node;
 use crate::net::ResourceHandler;
@@ -16,7 +16,6 @@ use style::selector_parser::RestyleDamage;
 use style::url::ComputedUrl;
 use style::values::computed::Float;
 use style::values::computed::Overflow;
-use style::values::computed::basic_shape::ClipPath;
 use style::values::computed::image::Image as ComputedImage;
 use style::values::generics::basic_shape::ShapeOutside;
 use style::values::generics::image::Image as StyloImage;
@@ -314,9 +313,13 @@ pub struct HoistedPaintChild {
     pub node_id: NodeId,
     pub z_index: i32,
     pub position: taffy::Point<f32>,
-    /// For a box hoisted at `z-index` 0, the padding boxes of the overflow-clipping boxes it
-    /// was hoisted past, intersected, in the frame of `position`; `None` when it passed none.
+    /// For a box hoisted at `z-index` 0, the padding boxes of the overflow-clipping boxes in
+    /// its containing block chain that it was hoisted past, intersected, in the frame of
+    /// `position`; `None` when there are none.
     pub clip: Option<taffy::Rect<f32>>,
+    /// Whether the stacking context it paints in lies strictly between it and its containing
+    /// block, so that the context's own overflow clip does not reach it (CSS 2.1 §11.1.1).
+    pub escapes_context_clip: bool,
 }
 
 impl HoistedPaintChild {
@@ -448,7 +451,13 @@ impl BaseDocument {
     }
 
     pub fn flush_styles_to_layout(&mut self, node_id: NodeId) {
-        self.flush_styles_to_layout_impl(node_id, None, LayoutFlow::HorizontalTb, &mut false, true);
+        self.flush_styles_to_layout_impl(
+            node_id,
+            None,
+            LayoutFlow::HorizontalTb,
+            &mut false,
+            AutoZHoisting::All,
+        );
     }
 
     /// Set the position and content area of every hoisted child from the finished layout.
@@ -464,7 +473,7 @@ impl BaseDocument {
             };
             for child in &mut context.children {
                 // Only boxes at z-index 0 are hoisted past an overflow clip.
-                (child.position, child.clip) =
+                (child.position, child.clip, child.escapes_context_clip) =
                     self.place_in_stacking_context(child.node_id, id, child.z_index == 0);
             }
             context.compute_content_size(self);
@@ -473,17 +482,25 @@ impl BaseDocument {
     }
 
     /// The origin of `id`'s layout parent in the frame the stacking context `root` paints its
-    /// children in and, with `is_clipped`, the intersection of the padding boxes of the
-    /// overflow-clipping boxes between them in that frame.
+    /// children in; with `is_clipped`, the intersection of the padding boxes of the
+    /// overflow-clipping boxes between them in that frame; and whether `root`'s own overflow
+    /// clip passes over the box. An overflow clip reaches a box only through its containing
+    /// block chain (CSS 2.1 §11.1.1), so a fixed box skips the ancestors strictly between it
+    /// and its containing block.
     fn place_in_stacking_context(
         &self,
         id: NodeId,
         root: NodeId,
         is_clipped: bool,
-    ) -> (taffy::Point<f32>, Option<taffy::Rect<f32>>) {
+    ) -> (taffy::Point<f32>, Option<taffy::Rect<f32>>, bool) {
+        let establishes_containing_block = |node: &Node| {
+            node.primary_styles()
+                .is_some_and(|style| establishes_fixed_containing_block(&style))
+        };
         let mut offset = taffy::Point::ZERO;
         // Kept less the offset carried so far, which moves every clip alike once complete.
         let mut clip: Option<taffy::Rect<f32>> = None;
+        let mut is_released = is_fixed_positioned(&self.nodes[id]);
         let mut ancestor = self.nodes[id].layout_parent.get();
         while let Some(id) = ancestor.filter(|&id| id != root) {
             let node = &self.nodes[id];
@@ -492,7 +509,8 @@ impl BaseDocument {
             let scroll_offset = node.scroll_offset();
             offset.x += location.x - scroll_offset.x as f32;
             offset.y += location.y - scroll_offset.y as f32;
-            if is_clipped && clips_overflow(node.style()) {
+            is_released &= !establishes_containing_block(node);
+            if is_clipped && !is_released && node.clips_own_overflow() {
                 let padding_box = taffy::Rect {
                     left: location.x + layout.border.left - offset.x,
                     right: location.x + layout.size.width - layout.border.right - offset.x,
@@ -514,19 +532,20 @@ impl BaseDocument {
             top: clip.top + offset.y,
             bottom: clip.bottom + offset.y,
         });
-        (offset, clip)
+        let escapes_root_clip = is_released && !establishes_containing_block(&self.nodes[root]);
+        (offset, clip, escapes_root_clip)
     }
 
     /// The `z-index` to hoist `child_id` to its stacking context with, or `None` to paint it
     /// with its parent. A non-zero `z-index` is hoisted. A fixed box of `z-index` auto or 0
     /// is too, as it paints above in-flow content even where its parent would paint below a
-    /// later sibling; then so is every positioned box after it, which paints above it (CSS
-    /// 2.1 Appendix E step 8).
+    /// later sibling; then so is every positioned box or stacking context after it, which
+    /// paints above it (CSS 2.1 Appendix E step 8).
     fn hoisted_z_index(
         &self,
         child_id: NodeId,
         is_flex_or_grid: bool,
-        can_hoist_auto_z: bool,
+        hoisting: AutoZHoisting,
         follows_fixed_box: bool,
     ) -> Option<i32> {
         let child = &self.nodes[child_id];
@@ -538,13 +557,18 @@ impl BaseDocument {
             // (css-flexbox-1 §painting, css-grid-1 §z-order).
             return (position != Position::Static || is_flex_or_grid).then_some(z_index);
         }
-        let is_at_fixed_box_level = match position {
-            Position::Fixed => true,
-            Position::Relative | Position::Absolute | Position::Sticky => follows_fixed_box,
-            Position::Static => false,
+        let can_hoist = match position {
+            Position::Fixed => hoisting != AutoZHoisting::None,
+            Position::Relative | Position::Absolute | Position::Sticky => {
+                follows_fixed_box && hoisting == AutoZHoisting::All
+            }
+            Position::Static => {
+                follows_fixed_box
+                    && hoisting == AutoZHoisting::All
+                    && child.is_stacking_context_root(is_flex_or_grid)
+            }
         };
-        (is_at_fixed_box_level && can_hoist_auto_z && child.style().display != taffy::Display::None)
-            .then_some(0)
+        (can_hoist && child.style().display != taffy::Display::None).then_some(0)
     }
 
     /// Flush the image layers of nodes whose style changed during the last
@@ -669,7 +693,7 @@ impl BaseDocument {
         parent_stacking_context: Option<&mut HoistedPaintChildren>,
         parent_flow: LayoutFlow,
         fixed_box_seen: &mut bool,
-        can_hoist_auto_z: bool,
+        hoisting: AutoZHoisting,
     ) {
         let mut new_stacking_context: HoistedPaintChildren = HoistedPaintChildren::new();
         let stacking_context = &mut new_stacking_context;
@@ -752,11 +776,17 @@ impl BaseDocument {
                 });
             }
 
-            let children_can_hoist_auto_z = parent_stacking_context.is_none()
-                || (can_hoist_auto_z
-                    && !self.nodes[node_id]
-                        .primary_styles()
-                        .is_some_and(|style| confines_descendants(&style)));
+            let children_hoisting = match self.nodes[node_id].primary_styles() {
+                _ if parent_stacking_context.is_none() => AutoZHoisting::All,
+                // Not yet a stacking context here: `contain`, `perspective`, `will-change`,
+                // and a `transform` until the second flush. A box hoisted past it would
+                // escape its containing block.
+                Some(style) if establishes_fixed_containing_block(&style) => AutoZHoisting::None,
+                Some(style) if clips_to_rounded_corners(&style) => {
+                    hoisting.min(AutoZHoisting::FixedOnly)
+                }
+                _ => hoisting,
+            };
 
             // Reserve space for paint_children
             let mut paint_children = self.nodes[node_id]
@@ -775,14 +805,20 @@ impl BaseDocument {
                 let follows_fixed_box = *fixed_box_seen;
 
                 if self.nodes[child_id].is_stacking_context_root(is_flex_or_grid) {
-                    self.flush_styles_to_layout_impl(child_id, None, flow, &mut false, true);
+                    self.flush_styles_to_layout_impl(
+                        child_id,
+                        None,
+                        flow,
+                        &mut false,
+                        AutoZHoisting::All,
+                    );
                 } else {
                     self.flush_styles_to_layout_impl(
                         child_id,
                         Some(stacking_context),
                         flow,
                         fixed_box_seen,
-                        children_can_hoist_auto_z,
+                        children_hoisting,
                     );
                 }
 
@@ -790,7 +826,7 @@ impl BaseDocument {
                 match self.hoisted_z_index(
                     child_id,
                     is_flex_or_grid,
-                    children_can_hoist_auto_z,
+                    children_hoisting,
                     follows_fixed_box,
                 ) {
                     Some(z_index) => {
@@ -803,6 +839,7 @@ impl BaseDocument {
                                 z_index,
                                 position: taffy::Point::ZERO,
                                 clip: None,
+                                escapes_context_clip: false,
                             },
                         );
                     }
@@ -836,22 +873,14 @@ impl BaseDocument {
     }
 }
 
-/// Whether a box holds its descendants in a group effect or a containing block for fixed
-/// boxes, which a box of `z-index` auto hoisted past it would escape. Some of these are
-/// stacking contexts by spec, but `is_stacking_context_root` knows only some of them, and a
-/// `transform` only from the second flush. A rectangular overflow clip does not confine: the
-/// hoisted box carries it along (see [`HoistedPaintChild::clip`]).
-fn confines_descendants(style: &ComputedValues) -> bool {
-    establishes_fixed_containing_block(style)
-        || clips_to_rounded_corners(style)
-        || !style.get_effects().backdrop_filter.0.is_empty()
-        || !matches!(style.clone_clip_path(), ClipPath::None)
-        || style
-            .get_svg()
-            .mask_image
-            .0
-            .iter()
-            .any(|image| !matches!(image, StyloImage::None))
+/// Which boxes of `z-index` auto or 0 can be hoisted past a box.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum AutoZHoisting {
+    None,
+    /// Only fixed boxes, which a rounded overflow clip below their containing block lets out;
+    /// a positioned box needs that clip, whose shape [`HoistedPaintChild::clip`] cannot carry.
+    FixedOnly,
+    All,
 }
 
 /// Whether a box clips its overflow to rounded corners, a shape the rectangular
@@ -868,11 +897,6 @@ fn clips_to_rounded_corners(style: &ComputedValues) -> bool {
         ]
         .into_iter()
         .any(|radius| !radius.is_zero())
-}
-
-/// Whether a box clips its overflow, as painting does for every box but the root element.
-fn clips_overflow(style: &taffy::Style<style::Atom>) -> bool {
-    style.overflow.x != taffy::Overflow::Visible || style.overflow.y != taffy::Overflow::Visible
 }
 
 #[inline(always)]
@@ -894,23 +918,30 @@ fn float_to_order(pos: Float) -> i32 {
 }
 
 /// Paint sort key: (paint level, order-modified position). Positioned
-/// (z-index: auto) descendants paint above in-flow content (CSS 2.1
-/// Appendix E step 8); within a level the stable sort preserves
-/// (order-modified) document order.
+/// (z-index: auto) descendants and stacking contexts paint above in-flow
+/// content (CSS 2.1 Appendix E step 8); within a level the stable sort
+/// preserves (order-modified) document order.
 #[inline(always)]
 fn node_to_paint_order(node: &Node, is_flex_or_grid: bool) -> (i32, i32) {
     let Some(style) = node.primary_styles() else {
         return (0, 0);
     };
     let position = style.clone_position();
+    let is_static_stacking_context =
+        position == Position::Static && node.is_stacking_context_root(is_flex_or_grid);
     if is_flex_or_grid {
         match position {
-            Position::Static => (0, style.clone_order()),
+            Position::Static => (
+                if is_static_stacking_context { 2 } else { 0 },
+                style.clone_order(),
+            ),
             Position::Relative | Position::Sticky => (2, style.clone_order()),
             // Out-of-flow children are not flex/grid items: `order` does
             // not apply; tree order does.
             Position::Absolute | Position::Fixed => (2, 0),
         }
+    } else if is_static_stacking_context {
+        (2, 0)
     } else {
         (
             position_to_order(position) + float_to_order(style.clone_float()),
@@ -921,7 +952,7 @@ fn node_to_paint_order(node: &Node, is_flex_or_grid: bool) -> (i32, i32) {
 
 #[cfg(test)]
 mod tests {
-    use crate::{Attribute, BaseDocument, DocumentConfig, NodeId, Point, qual_name};
+    use crate::{Attribute, BaseDocument, DocumentConfig, NodeId, Point, QualName, qual_name};
     use blitz_traits::shell::{ColorScheme, Viewport};
 
     /// `<html><body style="margin:0">` in a 400x300 viewport; returns the document and body.
@@ -963,6 +994,39 @@ mod tests {
     const CLIPPER: &str = "width:200px;height:100px;overflow:hidden";
     const FIXED: &str = "position:fixed;left:10px;top:10px;width:50px;height:50px";
 
+    /// A real `<html><body>` in a 400x300 viewport, each with its `style`.
+    fn page_with(html_style: &str, body_style: &str) -> (BaseDocument, NodeId, NodeId) {
+        let mut doc = BaseDocument::new(DocumentConfig {
+            viewport: Some(Viewport::new(400, 300, 1.0, ColorScheme::Light)),
+            ..Default::default()
+        });
+        let root_id = doc.root_node().id;
+        let html = append_tag(&mut doc, root_id, qual_name!("html"), html_style);
+        let body = append_tag(&mut doc, html, qual_name!("body"), body_style);
+        (doc, html, body)
+    }
+
+    fn append_tag(doc: &mut BaseDocument, parent: NodeId, name: QualName, style: &str) -> NodeId {
+        let mut mutator = doc.mutate();
+        let id = mutator.create_element(
+            name,
+            vec![Attribute {
+                name: qual_name!("style"),
+                value: format!("display:block;{style}"),
+            }],
+        );
+        mutator.append_children(parent, &[id]);
+        id
+    }
+
+    fn escapes_clip(doc: &BaseDocument, root: NodeId, id: NodeId) -> bool {
+        let context = doc.nodes[root].stacking_context.as_ref().unwrap();
+        let child = context.children.iter().find(|child| child.node_id == id);
+        child
+            .expect("hoisted to the given stacking context")
+            .escapes_context_clip
+    }
+
     /// CSS 2.1 Appendix E step 8: the fixed box paints above in-flow content, even content
     /// after its static parent inside an ancestor that clips it.
     #[test]
@@ -981,13 +1045,8 @@ mod tests {
         );
         assert_eq!(
             hoisted_clip(&doc, fixed),
-            Some(taffy::Rect {
-                left: 0.0,
-                right: 200.0,
-                top: 0.0,
-                bottom: 100.0
-            }),
-            "hoisted with the clipper's padding box"
+            None,
+            "the viewport is its containing block, so the clipper does not clip it"
         );
         assert_eq!(
             hit(&doc, 20.0, 30.0),
@@ -1001,9 +1060,10 @@ mod tests {
         );
     }
 
-    /// Hoisting must not release the clip: past the clipper the box is neither painted nor hit.
+    /// CSS 2.1 §11.1.1: overflow does not clip a descendant whose containing block is the
+    /// viewport, so the box paints and is hit past the clipper.
     #[test]
-    fn a_fixed_box_hoisted_past_a_clip_is_not_hit_outside_it() {
+    fn a_fixed_box_is_not_clipped_by_a_static_overflow_ancestor() {
         let (mut doc, body) = page();
         let clipper = append(&mut doc, body, CLIPPER);
         let fixed = append(
@@ -1013,36 +1073,214 @@ mod tests {
         );
         doc.resolve(0.0);
 
-        assert_eq!(hit(&doc, 20.0, 90.0), Some(fixed), "inside the clip");
-        assert_ne!(hit(&doc, 20.0, 110.0), Some(fixed), "past the clip");
+        assert_eq!(hoisted_clip(&doc, fixed), None, "released from the clipper");
+        assert_eq!(hit(&doc, 20.0, 90.0), Some(fixed), "inside the clipper");
+        assert_eq!(hit(&doc, 20.0, 110.0), Some(fixed), "past the clipper");
+    }
+
+    /// The propagated `overflow` belongs to the viewport: `<body>` clips nothing, for a fixed
+    /// box nor for a positioned box after it (CSS Overflow 3 §3.1.4).
+    #[test]
+    fn a_body_whose_overflow_propagates_to_the_viewport_clips_nothing() {
+        let (mut doc, _, body) = page_with("", "margin:0;overflow:hidden;height:20px");
+        let fixed = append(
+            &mut doc,
+            body,
+            "position:fixed;left:10px;top:50px;width:50px;height:50px",
+        );
+        let later = append(
+            &mut doc,
+            body,
+            "position:absolute;left:100px;top:50px;width:50px;height:50px",
+        );
+        doc.resolve(0.0);
+
+        assert!(doc.nodes[body].is_overflow_propagated_body());
+        assert_eq!(hoisted_clip(&doc, fixed), None);
+        assert_eq!(hoisted_clip(&doc, later), None, "the body has no clip left");
+        assert_eq!(hit(&doc, 20.0, 60.0), Some(fixed), "past the body's box");
+        assert_eq!(hit(&doc, 110.0, 60.0), Some(later), "past the body's box");
+    }
+
+    /// With the root's own `overflow` set, `<body>` keeps its own and it does clip, so a
+    /// positioned box inside it keeps the clip. The fixed box still ignores it: the viewport
+    /// is its containing block.
+    #[test]
+    fn a_body_keeps_its_overflow_clip_when_the_root_sets_its_own_overflow() {
+        let (mut doc, html, body) =
+            page_with("overflow:hidden", "margin:0;overflow:hidden;height:20px");
+        let fixed = append(
+            &mut doc,
+            body,
+            "position:fixed;left:10px;top:50px;width:50px;height:50px",
+        );
+        let later = append(
+            &mut doc,
+            body,
+            "position:relative;left:100px;top:50px;width:50px;height:50px",
+        );
+        doc.resolve(0.0);
+
+        assert!(!doc.nodes[body].is_overflow_propagated_body());
+        assert_eq!(hoisted_clip(&doc, fixed), None);
+        assert!(hoisted_clip(&doc, later).is_some(), "the body clip stays");
+        assert!(
+            !escapes_clip(&doc, html, later),
+            "a positioned box's containing block chain goes through the root"
+        );
+        assert_ne!(hit(&doc, 110.0, 60.0), Some(later), "past the body's box");
+    }
+
+    /// The transformed box is the containing block, so its own overflow does clip the box.
+    #[test]
+    fn a_fixed_box_stays_clipped_by_a_transformed_containing_block() {
+        let (mut doc, body) = page();
+        let clipper = append(
+            &mut doc,
+            body,
+            "margin-left:30px;width:100px;height:100px;overflow:hidden;transform:translate(1px,0)",
+        );
+        let fixed = append(
+            &mut doc,
+            clipper,
+            "position:fixed;left:10px;top:50px;width:50px;height:80px",
+        );
+        doc.resolve(0.0);
+        doc.resolve(0.0);
+
+        assert!(
+            !escapes_clip(&doc, clipper, fixed),
+            "stays in the clip layer"
+        );
+        assert_eq!(hit(&doc, 50.0, 90.0), Some(fixed), "inside the clipper");
+        assert_ne!(hit(&doc, 50.0, 110.0), Some(fixed), "past the clipper");
+    }
+
+    /// An `overflow` box strictly between the fixed box and its transformed containing block
+    /// is not in its containing block chain (CSS 2.1 §11.1.1).
+    #[test]
+    fn a_fixed_box_is_not_clipped_between_it_and_its_containing_block() {
+        let (mut doc, body) = page();
+        let containing_block = append(
+            &mut doc,
+            body,
+            "width:200px;height:200px;transform:translate(1px,0)",
+        );
+        let clipper = append(&mut doc, containing_block, CLIPPER);
+        let fixed = append(
+            &mut doc,
+            clipper,
+            "position:fixed;left:10px;top:80px;width:50px;height:50px",
+        );
+        doc.resolve(0.0);
+        doc.resolve(0.0);
+
+        assert_eq!(hit(&doc, 20.0, 90.0), Some(fixed), "inside the clipper");
+        assert_eq!(hit(&doc, 20.0, 110.0), Some(fixed), "past the clipper");
+    }
+
+    /// The fixed box leaves the clip of a stacking context that is not its containing block,
+    /// while a positioned box of that same context, in its containing block chain, keeps it.
+    #[test]
+    fn a_fixed_box_leaves_the_clip_of_a_stacking_context_that_is_not_its_containing_block() {
+        let (mut doc, body) = page();
+        let clipper = append(&mut doc, body, &format!("{CLIPPER};opacity:0.5"));
+        let fixed = append(
+            &mut doc,
+            clipper,
+            "position:fixed;left:10px;top:80px;width:50px;height:50px",
+        );
+        let later = append(
+            &mut doc,
+            clipper,
+            "position:relative;left:100px;top:80px;width:50px;height:50px",
+        );
+        doc.resolve(0.0);
+
+        assert!(escapes_clip(&doc, clipper, fixed), "out of the clip layer");
+        assert!(
+            !escapes_clip(&doc, clipper, later),
+            "stays in the clip layer"
+        );
+        assert_eq!(hit(&doc, 20.0, 110.0), Some(fixed), "past the clip");
+        assert_ne!(hit(&doc, 110.0, 110.0), Some(later), "past the clip");
+    }
+
+    /// WPT clipping-006: the fixed child of a clipping fixed box shows outside it, the
+    /// viewport being its containing block too.
+    #[test]
+    fn a_fixed_box_leaves_the_clip_of_a_fixed_ancestor() {
+        let (mut doc, body) = page();
+        let outer = append(
+            &mut doc,
+            body,
+            "position:fixed;left:0;top:0;width:100px;height:50px;overflow:hidden",
+        );
+        let inner = append(
+            &mut doc,
+            outer,
+            "position:fixed;left:10px;top:60px;width:30px;height:30px",
+        );
+        doc.resolve(0.0);
+
+        assert!(
+            escapes_clip(&doc, outer, inner),
+            "out of the outer clip layer"
+        );
+        assert_eq!(hit(&doc, 20.0, 70.0), Some(inner), "past the outer box");
+    }
+
+    /// An `absolute` box after the fixed box keeps the clip of its positioned clipper: unlike
+    /// the fixed box, its containing block is that clipper.
+    #[test]
+    fn an_absolute_sibling_after_a_released_fixed_box_stays_clipped() {
+        let (mut doc, body) = page();
+        let clipper = append(&mut doc, body, &format!("{CLIPPER};position:relative"));
+        let fixed = append(
+            &mut doc,
+            clipper,
+            "position:fixed;left:10px;top:80px;width:50px;height:50px",
+        );
+        let later = append(
+            &mut doc,
+            clipper,
+            "position:absolute;left:100px;top:80px;width:50px;height:50px",
+        );
+        doc.resolve(0.0);
+
+        assert_eq!(hoisted_clip(&doc, fixed), None, "released");
+        assert!(hoisted_clip(&doc, later).is_some(), "keeps the clip");
+        assert_eq!(hit(&doc, 110.0, 90.0), Some(later), "inside the clip");
+        assert_ne!(hit(&doc, 110.0, 110.0), Some(later), "past the clip");
     }
 
     /// The clip is the scroll container's box, which stays put while its content scrolls.
     #[test]
     fn the_clip_of_a_scrolled_container_stays_with_its_box() {
         let (mut doc, body) = page();
+        append(
+            &mut doc,
+            body,
+            "position:fixed;left:300px;top:0;width:10px;height:10px",
+        );
         let scroller = append(
             &mut doc,
             body,
             "margin:50px;width:100px;height:100px;overflow:auto",
         );
-        let fixed = append(
-            &mut doc,
-            scroller,
-            "position:fixed;left:60px;top:120px;width:40px;height:50px",
-        );
+        let later = append(&mut doc, scroller, "position:relative;height:300px");
         doc.resolve(0.0);
         *doc.nodes[scroller].scroll_offset_mut() = Point { x: 0.0, y: 40.0 };
         doc.resolve(0.0);
 
         assert_eq!(
             hit(&doc, 65.0, 140.0),
-            Some(fixed),
+            Some(later),
             "inside the container's box"
         );
         assert_ne!(
             hit(&doc, 65.0, 160.0),
-            Some(fixed),
+            Some(later),
             "below the container's box"
         );
     }
@@ -1106,28 +1344,25 @@ mod tests {
         !is_hoisted && paints.unwrap_or_default().contains(&id)
     }
 
-    /// A rounded clipper's corners must still clip the fixed box: past them, inside the
-    /// clipper's padding box, it is not painted.
+    /// A rounded clipper is an overflow ancestor like any other: a fixed box whose containing
+    /// block is the viewport leaves it, so it is painted hoisted and hit past its corners.
     #[test]
-    fn a_fixed_box_under_a_rounded_clip_paints_inside_its_corners() {
+    fn a_fixed_box_is_not_clipped_by_a_rounded_overflow_ancestor() {
         let (mut doc, body) = page();
         let clipper = append(&mut doc, body, ROUNDED_CLIPPER);
         let fixed = append(
             &mut doc,
             clipper,
-            "position:fixed;left:0;top:0;width:200px;height:100px",
+            "position:fixed;left:0;top:80px;width:50px;height:50px",
         );
         doc.resolve(0.0);
 
         assert!(
-            paints_with(&doc, clipper, fixed),
-            "painted inside the rounded clip"
+            !paints_with(&doc, clipper, fixed),
+            "hoisted out of the rounded clip"
         );
-        assert_eq!(
-            hit(&doc, 100.0, 50.0),
-            Some(fixed),
-            "at the clipper's centre"
-        );
+        assert_eq!(hoisted_clip(&doc, fixed), None);
+        assert_eq!(hit(&doc, 10.0, 110.0), Some(fixed), "past the clipper");
     }
 
     /// The same for a positioned box hoisted for following a fixed box elsewhere on the page.
@@ -1152,5 +1387,158 @@ mod tests {
             Some(badge),
             "at the clipper's centre"
         );
+    }
+
+    const EFFECTS: [&str; 4] = [
+        "filter:blur(1px)",
+        "backdrop-filter:blur(1px)",
+        "clip-path:inset(0)",
+        "mask-image:linear-gradient(black,black)",
+    ];
+
+    /// A static stacking context sorts at CSS 2.1 Appendix E step 8, not with in-flow content.
+    /// Two resolves, as a `transform` is known to `is_stacking_context_root` from the second.
+    #[test]
+    fn a_static_stacking_context_paints_above_its_later_in_flow_sibling() {
+        for property in EFFECTS
+            .iter()
+            .chain(&["opacity:0.5", "transform:translate(1px,0)"])
+        {
+            let (mut doc, body) = page();
+            let stacked = append(
+                &mut doc,
+                body,
+                &format!("width:100px;height:100px;{property}"),
+            );
+            let later = append(&mut doc, body, "width:100px;height:100px;margin-top:-50px");
+            doc.resolve(0.0);
+            doc.resolve(0.0);
+
+            assert_eq!(
+                hit(&doc, 10.0, 75.0),
+                Some(stacked),
+                "{property}: above the in-flow sibling after it"
+            );
+            assert_eq!(
+                hit(&doc, 10.0, 125.0),
+                Some(later),
+                "{property}: the sibling shows past it"
+            );
+        }
+    }
+
+    /// Step 8 is tree order, so an effect box after a fixed box paints above it, and, being
+    /// hoisted with it, above in-flow content that follows the effect box's static parent.
+    #[test]
+    fn a_static_effect_box_after_a_fixed_box_paints_above_it_and_all_in_flow_content() {
+        for effect in EFFECTS {
+            let (mut doc, body) = page();
+            append(
+                &mut doc,
+                body,
+                "position:fixed;left:0;top:0;width:100px;height:100px",
+            );
+            let parent = append(&mut doc, body, "width:200px;height:100px");
+            let effect_box = append(
+                &mut doc,
+                parent,
+                &format!("width:100px;height:100px;{effect}"),
+            );
+            let later = append(&mut doc, body, "width:200px;height:100px;margin-top:-50px");
+            doc.resolve(0.0);
+
+            assert_eq!(
+                hit(&doc, 10.0, 10.0),
+                Some(effect_box),
+                "{effect}: above the earlier fixed box"
+            );
+            assert_eq!(
+                hit(&doc, 10.0, 75.0),
+                Some(effect_box),
+                "{effect}: above the in-flow content after its parent"
+            );
+            assert_eq!(
+                hit(&doc, 150.0, 75.0),
+                Some(later),
+                "{effect}: the later content shows past it"
+            );
+        }
+    }
+
+    /// An effect box is a stacking context: a `z-index` inside it orders only within it, so
+    /// the descendant stays under a later `z-index: 0` sibling of the effect box.
+    #[test]
+    fn a_z_index_descendant_of_a_static_effect_box_stays_inside_it() {
+        for effect in EFFECTS {
+            let (mut doc, body) = page();
+            let effect_box = append(
+                &mut doc,
+                body,
+                &format!("width:100px;height:100px;{effect}"),
+            );
+            let inner = append(
+                &mut doc,
+                effect_box,
+                "position:absolute;z-index:1;left:0;top:0;width:50px;height:50px",
+            );
+            let later = append(
+                &mut doc,
+                body,
+                "position:relative;z-index:0;width:100px;height:100px;margin-top:-100px",
+            );
+            doc.resolve(0.0);
+
+            let context = doc.nodes[effect_box].stacking_context.as_ref();
+            assert!(
+                context.is_some_and(|context| {
+                    context.children.iter().any(|child| child.node_id == inner)
+                }),
+                "{effect}: hoisted no further than the effect box"
+            );
+            assert_eq!(
+                hit(&doc, 10.0, 10.0),
+                Some(later),
+                "{effect}: under the later z-index:0 sibling"
+            );
+        }
+    }
+
+    /// Whether `id` paints in the group of `ancestor`, as a child or in its stacking context.
+    fn paints_inside(doc: &BaseDocument, ancestor: NodeId, id: NodeId) -> bool {
+        let node = &doc.nodes[ancestor];
+        let is_paint_child = node
+            .paint_children
+            .borrow()
+            .iter()
+            .flatten()
+            .any(|&child| child == id);
+        let is_hoisted_child = node
+            .stacking_context
+            .as_ref()
+            .is_some_and(|context| context.children.iter().any(|child| child.node_id == id));
+        is_paint_child || is_hoisted_child
+    }
+
+    /// CSS 2.1 §9.9.1: a box belongs to one stacking context, whatever its containing block,
+    /// so a fixed box stays in the group of each of these ancestors and takes its effect.
+    /// Two resolves, as a `transform` is known to `is_stacking_context_root` from the second.
+    #[test]
+    fn a_fixed_box_paints_inside_the_group_of_an_effect_ancestor() {
+        for effect in EFFECTS.iter().chain(&["transform:translate(1px,0)"]) {
+            let (mut doc, body) = page();
+            let ancestor = append(
+                &mut doc,
+                body,
+                &format!("width:100px;height:100px;{effect}"),
+            );
+            let fixed = append(&mut doc, ancestor, FIXED);
+            doc.resolve(0.0);
+            doc.resolve(0.0);
+
+            assert!(
+                paints_inside(&doc, ancestor, fixed),
+                "{effect}: painted in the ancestor's group, not hoisted past it"
+            );
+        }
     }
 }

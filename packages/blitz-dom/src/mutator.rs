@@ -10,7 +10,7 @@ use crate::node::{CanvasData, NodeFlags, SpecialElementData};
 use crate::util::ImageType;
 use crate::{
     AttachShadowError, Attribute, BaseDocument, Document, ElementData, Node, NodeData, QualName,
-    local_name, qual_name,
+    local_name, ns, qual_name,
 };
 use blitz_traits::shell::Viewport;
 use style::Atom;
@@ -22,6 +22,19 @@ macro_rules! tag_and_attr {
     ($tag:tt, $attr:tt) => {
         (&local_name!($tag), &local_name!($attr))
     };
+}
+
+/// An element's ID is its null-namespace `id` attribute alone (DOM §4.9).
+fn is_id_attribute(name: &QualName) -> bool {
+    name.ns == ns!() && name.local == local_name!("id")
+}
+
+fn id_attribute(node: &Node) -> Option<String> {
+    let attr = node
+        .attrs()?
+        .iter()
+        .find(|attr| is_id_attribute(&attr.name))?;
+    Some(attr.value.to_string())
 }
 
 #[derive(Debug, Clone)]
@@ -280,7 +293,7 @@ impl DocumentMutator<'_> {
             self.doc.nodes[node_id].mark_ancestors_dirty();
         }
 
-        if name.local == local_name!("id") && node_is_in_document {
+        if is_id_attribute(&name) && node_is_in_document {
             if let Some(old_id) = self.doc.nodes[node_id]
                 .element_data()
                 .map(|element| element.id.clone())
@@ -331,7 +344,7 @@ impl DocumentMutator<'_> {
         let tag = &element.name.local;
         let attr = &name.local;
 
-        if *attr == local_name!("id") {
+        if is_id_attribute(&name) {
             element.id = Some(Atom::from(value))
         }
 
@@ -405,7 +418,7 @@ impl DocumentMutator<'_> {
             node.mark_ancestors_dirty();
         }
 
-        if name.local == local_name!("id") && node_is_in_document {
+        if is_id_attribute(&name) && node_is_in_document {
             if let Some(old_id) = self.doc.nodes[node_id]
                 .element_data()
                 .and_then(|element| element.id.clone())
@@ -436,7 +449,7 @@ impl DocumentMutator<'_> {
                 .attribute_changed(&name.local, old_value, None);
         }
 
-        if name.local == local_name!("id") {
+        if is_id_attribute(&name) {
             element.id = None;
         }
 
@@ -949,7 +962,7 @@ impl<'doc> DocumentMutator<'doc> {
 
             // If the node has an "id" attribute, store it in the ID map. Ids
             // inside a shadow tree are not visible to the document.
-            if let Some(id_attr) = node.attr(local_name!("id")).map(ToString::to_string) {
+            if let Some(id_attr) = id_attribute(node) {
                 if !node.is_in_shadow_tree() {
                     doc.add_to_id_map(&id_attr, node_id);
                 }
@@ -1026,7 +1039,7 @@ impl<'doc> DocumentMutator<'doc> {
             }
 
             // If the node has an "id" attribute remove it from the ID map.
-            if let Some(id_attr) = node.attr(local_name!("id")).map(ToString::to_string) {
+            if let Some(id_attr) = id_attribute(node) {
                 doc.remove_from_id_map(&id_attr, node_id);
             }
 
@@ -1576,6 +1589,55 @@ mod test {
             mutator.clear_attribute(node_id, qual_name!("id"));
         }
         assert_eq!(document.get_element_by_id("new"), None);
+    }
+
+    /// An `id` in another namespace is a plain attribute: `getElementById` and `#id` match the
+    /// null-namespace one alone, including through insertion and removal of the element.
+    #[test]
+    fn only_the_null_namespace_id_attribute_is_the_elements_id() {
+        let mut document = BaseDocument::new(DocumentConfig::default());
+        let root_id = document.root_node().id;
+        let namespaced_id = crate::QualName::new(None, crate::ns!(xlink), crate::local_name!("id"));
+
+        let (written_attached, written_detached) = {
+            let mut mutator = document.mutate();
+            let written_attached = mutator.create_element(qual_name!("div"), vec![]);
+            let written_detached = mutator.create_element(qual_name!("div"), vec![]);
+            mutator.append_children(root_id, &[written_attached]);
+            mutator.set_attribute(written_attached, namespaced_id.clone(), "attached");
+            mutator.set_attribute(written_detached, namespaced_id.clone(), "detached");
+            mutator.append_children(root_id, &[written_detached]);
+            (written_attached, written_detached)
+        };
+        assert_eq!(document.get_element_by_id("attached"), None);
+        assert_eq!(document.get_element_by_id("detached"), None);
+        let element_id = |document: &BaseDocument, id: crate::NodeId| {
+            document.nodes[id].element_data().unwrap().id.clone()
+        };
+        assert_eq!(element_id(&document, written_attached), None);
+
+        {
+            let mut mutator = document.mutate();
+            mutator.set_attribute(written_attached, qual_name!("id"), "real");
+            mutator.clear_attribute(written_attached, namespaced_id.clone());
+        }
+        assert_eq!(document.get_element_by_id("real"), Some(written_attached));
+        assert_eq!(
+            element_id(&document, written_attached),
+            Some(style::Atom::from("real")),
+            "clearing the namespaced attribute leaves the id"
+        );
+
+        {
+            let mut mutator = document.mutate();
+            mutator.set_attribute(written_detached, qual_name!("id"), "second");
+            mutator.remove_node(written_detached);
+        }
+        assert_eq!(
+            document.get_element_by_id("second"),
+            None,
+            "removal unregisters the real id, not the namespaced attribute before it"
+        );
     }
 
     #[test]
