@@ -9,11 +9,13 @@ use crate::node::{LayoutFlow, NodeFlags};
 use crate::{
     BaseDocument, net::ImageHandler, node::ImageResourceData, node::Status, util::ImageLayerKind,
 };
+use style::Zero;
 use style::properties::ComputedValues;
 use style::properties::generated::longhands::position::computed_value::T as Position;
 use style::selector_parser::RestyleDamage;
 use style::url::ComputedUrl;
 use style::values::computed::Float;
+use style::values::computed::Overflow;
 use style::values::computed::basic_shape::ClipPath;
 use style::values::computed::image::Image as ComputedImage;
 use style::values::generics::basic_shape::ShapeOutside;
@@ -837,10 +839,11 @@ impl BaseDocument {
 /// Whether a box holds its descendants in a group effect or a containing block for fixed
 /// boxes, which a box of `z-index` auto hoisted past it would escape. Some of these are
 /// stacking contexts by spec, but `is_stacking_context_root` knows only some of them, and a
-/// `transform` only from the second flush. An overflow clip does not confine: the hoisted box
-/// carries it along (see [`HoistedPaintChild::clip`]).
+/// `transform` only from the second flush. A rectangular overflow clip does not confine: the
+/// hoisted box carries it along (see [`HoistedPaintChild::clip`]).
 fn confines_descendants(style: &ComputedValues) -> bool {
     establishes_fixed_containing_block(style)
+        || clips_to_rounded_corners(style)
         || !style.get_effects().backdrop_filter.0.is_empty()
         || !matches!(style.clone_clip_path(), ClipPath::None)
         || style
@@ -849,6 +852,22 @@ fn confines_descendants(style: &ComputedValues) -> bool {
             .0
             .iter()
             .any(|image| !matches!(image, StyloImage::None))
+}
+
+/// Whether a box clips its overflow to rounded corners, a shape the rectangular
+/// [`HoistedPaintChild::clip`] does not carry.
+fn clips_to_rounded_corners(style: &ComputedValues) -> bool {
+    let box_style = style.get_box();
+    let border = style.get_border();
+    (box_style.overflow_x != Overflow::Visible || box_style.overflow_y != Overflow::Visible)
+        && [
+            &border.border_top_left_radius,
+            &border.border_top_right_radius,
+            &border.border_bottom_right_radius,
+            &border.border_bottom_left_radius,
+        ]
+        .into_iter()
+        .any(|radius| !radius.is_zero())
 }
 
 /// Whether a box clips its overflow, as painting does for every box but the root element.
@@ -1073,6 +1092,65 @@ mod tests {
             hit(&doc, 20.0, 15.0),
             Some(fixed),
             "the rest is the fixed box"
+        );
+    }
+
+    const ROUNDED_CLIPPER: &str = "width:200px;height:100px;overflow:hidden;border-radius:20px";
+
+    /// Whether `id` paints with `parent`, inside its clip layer, which paint shapes with the
+    /// parent's corner radii, rather than hoisted with a rectangular clip.
+    fn paints_with(doc: &BaseDocument, parent: NodeId, id: NodeId) -> bool {
+        let context = doc.root_element().stacking_context.as_ref().unwrap();
+        let is_hoisted = context.children.iter().any(|child| child.node_id == id);
+        let paints = doc.nodes[parent].paint_children.borrow().clone();
+        !is_hoisted && paints.unwrap_or_default().contains(&id)
+    }
+
+    /// A rounded clipper's corners must still clip the fixed box: past them, inside the
+    /// clipper's padding box, it is not painted.
+    #[test]
+    fn a_fixed_box_under_a_rounded_clip_paints_inside_its_corners() {
+        let (mut doc, body) = page();
+        let clipper = append(&mut doc, body, ROUNDED_CLIPPER);
+        let fixed = append(
+            &mut doc,
+            clipper,
+            "position:fixed;left:0;top:0;width:200px;height:100px",
+        );
+        doc.resolve(0.0);
+
+        assert!(
+            paints_with(&doc, clipper, fixed),
+            "painted inside the rounded clip"
+        );
+        assert_eq!(
+            hit(&doc, 100.0, 50.0),
+            Some(fixed),
+            "at the clipper's centre"
+        );
+    }
+
+    /// The same for a positioned box hoisted for following a fixed box elsewhere on the page.
+    #[test]
+    fn a_positioned_box_under_a_rounded_clip_after_a_fixed_box_paints_inside_its_corners() {
+        let (mut doc, body) = page();
+        append(
+            &mut doc,
+            body,
+            "position:fixed;left:0;top:200px;width:400px;height:20px",
+        );
+        let clipper = append(&mut doc, body, ROUNDED_CLIPPER);
+        let badge = append(&mut doc, clipper, "position:relative;height:100px");
+        doc.resolve(0.0);
+
+        assert!(
+            paints_with(&doc, clipper, badge),
+            "painted inside the rounded clip"
+        );
+        assert_eq!(
+            hit(&doc, 100.0, 50.0),
+            Some(badge),
+            "at the clipper's centre"
         );
     }
 }
