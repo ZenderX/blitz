@@ -413,13 +413,23 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
         }) * transform;
         let screen_bbox = screen_transform.transform_rect_bbox(overflow.union(border_box));
 
+        let has_released_box = node
+            .stacking_context
+            .as_ref()
+            .is_some_and(|context| context.has_released_box);
+        let is_fixed_containing_block = node.establishes_fixed_containing_block();
+        // A box released through this one paints past the clips open around it.
+        let released_clip_rect = enclosing_clip
+            .filter(|_| has_released_box && !is_fixed_containing_block)
+            .map_or(clip_rect, ContentClip::outermost_unclipped_rect);
+
         // Cull elements that fall entirely outside the current clip rectangle. In addition to
         // the viewport, `clip_rect` is narrowed by any ancestor scrollport (see below), so this
         // also culls elements scrolled out of view inside a clipping/scrolling container.
-        if screen_bbox.x1 < clip_rect.x0
-            || screen_bbox.x0 > clip_rect.x1
-            || screen_bbox.y1 < clip_rect.y0
-            || screen_bbox.y0 > clip_rect.y1
+        if screen_bbox.x1 < released_clip_rect.x0
+            || screen_bbox.x0 > released_clip_rect.x1
+            || screen_bbox.y1 < released_clip_rect.y0
+            || screen_bbox.y0 > released_clip_rect.y1
         {
             return;
         }
@@ -466,6 +476,15 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
         cx.draw_outline(scene);
         cx.draw_outset_box_shadow(scene);
 
+        // A group cannot be left from inside, so one a box is released through opens outside
+        // the clips around it, which are re-applied inside it for its other content.
+        let released_group_clip = enclosing_clip.filter(|_| {
+            has_released_box && !is_fixed_containing_block && node.paints_in_group_layer()
+        });
+        if let Some(released_group_clip) = released_group_clip {
+            released_group_clip.step_out(scene);
+        }
+
         // clip-path clip ayer
         self.layer_manager.maybe_with_layer(
             scene,
@@ -505,12 +524,19 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                     .unwrap_or(Rect::ZERO);
 
                 let has_effect_layer = has_opacity || filter.is_some() || backdrop_filter.is_some();
-                let has_released_box = node
-                    .stacking_context
-                    .as_ref()
-                    .is_some_and(|context| context.has_released_box);
+                // A group never clips its content, so the layer reaches a contained fixed box;
+                // only the box's own overflow, or a referenced filter's region, can stop it.
+                let reaches_contained_fixed_box = has_released_box
+                    && is_fixed_containing_block
+                    && !should_clip
+                    && filter_region.is_none();
 
-                let mut effect_layer_clip = border_box;
+                let group_box = if reaches_contained_fixed_box {
+                    border_box.union(*node.scrollable_overflow())
+                } else {
+                    border_box
+                };
+                let mut effect_layer_clip = group_box;
                 effect_layer_clip.x0 += filter_expansion_area.x0;
                 effect_layer_clip.y0 += filter_expansion_area.y0;
                 effect_layer_clip.x1 += filter_expansion_area.x1;
@@ -521,12 +547,33 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                     effect_layer_clip = region;
                 }
 
-                // Released boxes only occur under opacity: a filter is their containing block.
-                let (effect_layer_transform, effect_layer_clip) = if has_released_box {
-                    let origin = Vec2::new(self.initial_x, self.initial_y);
-                    (Affine::IDENTITY, clip_rect + origin)
+                // A box released through this group lies under opacity alone: a filter is its
+                // containing block.
+                let (effect_layer_transform, effect_layer_clip) =
+                    if has_released_box && !is_fixed_containing_block {
+                        let origin = Vec2::new(self.initial_x, self.initial_y);
+                        (Affine::IDENTITY, released_clip_rect + origin)
+                    } else {
+                        (cx.transform, effect_layer_clip)
+                    };
+
+                // The backdrop sample is the border box whatever the group reaches
+                // (filter-effects-2 step 4), so a widened group samples it in a layer of its
+                // own, before the group's content is drawn over it.
+                let backdrop_filter = if reaches_contained_fixed_box {
+                    self.layer_manager.maybe_with_layer(
+                        scene,
+                        backdrop_filter.is_some(),
+                        opacity,
+                        cx.transform,
+                        &cx.frame.border_box_path(),
+                        None,
+                        backdrop_filter,
+                        |_| {},
+                    );
+                    None
                 } else {
-                    (cx.transform, effect_layer_clip)
+                    backdrop_filter
                 };
 
                 // Opacity/Filter layer if box has opacity or a filter.
@@ -540,6 +587,10 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                     filter,
                     backdrop_filter,
                     |scene| {
+                        if let Some(released_group_clip) = released_group_clip {
+                            released_group_clip.step_back_in(scene);
+                        }
+
                         // vello sizes a filter layer to what is drawn into it, so the
                         // region is drawn (transparent, which changes no pixel) for a
                         // flood to fill all of it.
@@ -582,10 +633,15 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                             None,
                             None,
                         );
-                        // A released child cannot leave a group layer or its containing block's clip.
+                        // A released child cannot leave a group layer or its containing block's
+                        // clip; of the clips around a group only the re-applied ones are open here.
                         let has_group_layer =
                             has_clip_path || mask_layer_pushed || has_effect_layer;
-                        let enclosing_clip = enclosing_clip.filter(|_| !has_group_layer);
+                        let enclosing_clip = if has_group_layer {
+                            released_group_clip
+                        } else {
+                            enclosing_clip
+                        };
                         let content_clip = ContentClip {
                             shape: clip,
                             transform: cx.transform,
@@ -636,6 +692,10 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                         // The `resize` grip, unscrolled above the content and scrollbars.
                         cx.transform = unscrolled_transform;
                         cx.draw_resizer(scene);
+
+                        if let Some(released_group_clip) = released_group_clip {
+                            released_group_clip.step_out(scene);
+                        }
                     },
                 );
 
@@ -644,6 +704,10 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                 cx.maybe_pop_css_mask_layer(scene, mask_layer_pushed);
             },
         );
+
+        if let Some(released_group_clip) = released_group_clip {
+            released_group_clip.step_back_in(scene);
+        }
     }
 
     fn render_node(

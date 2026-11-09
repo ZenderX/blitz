@@ -1,7 +1,7 @@
 use crate::Document;
 pub use crate::layout::damage::HoistedPaintChild;
 use crate::layout::damage::HoistedPaintChildren;
-use crate::layout::fixed::establishes_fixed_containing_block;
+use crate::layout::fixed::{applies_paint_containment, establishes_fixed_containing_block};
 use bitflags::bitflags;
 use blitz_traits::events::{
     BlitzPointerEvent, BlitzPointerId, DomEventData, HitResult, PointerCoords,
@@ -1170,7 +1170,7 @@ impl Node {
             return true;
         }
 
-        if self.transform().is_some() {
+        if self.establishes_fixed_containing_block() {
             return true;
         }
 
@@ -1180,14 +1180,14 @@ impl Node {
 
         // TODO: mix-blend-mode
         // TODO: isolation
-        // TODO: contain
 
         false
     }
 
     /// Whether paint draws this box in a group layer (opacity, a filter, a clip-path or a
-    /// mask), which a descendant cannot step out of to leave an overflow clip around it.
-    fn paints_in_group_layer(&self) -> bool {
+    /// mask), which a descendant cannot step out of to leave an overflow clip around it, so
+    /// such a group opens outside the clip when a box is released through it.
+    pub fn paints_in_group_layer(&self) -> bool {
         self.primary_styles().is_some_and(|style| {
             let effects = style.get_effects();
             style.clone_opacity() != 1.0
@@ -1243,8 +1243,13 @@ impl Node {
         use style::computed_values::pointer_events::T as PointerEvents;
         use style::computed_values::visibility::T as Visibility;
 
+        let has_released_box = self
+            .stacking_context
+            .as_ref()
+            .is_some_and(|context| context.has_released_box);
         if is_clipped_out
-            && (self.paints_in_group_layer() || self.establishes_fixed_containing_block())
+            && (self.establishes_fixed_containing_block()
+                || (self.paints_in_group_layer() && !has_released_box))
         {
             return None;
         }
@@ -1375,8 +1380,20 @@ impl Node {
             }
         }
 
+        // A containing block's clip holds everything in it, boxes released from a stacking
+        // context inside it included, so its children are not searched past that clip.
+        let is_past_containing_clip =
+            is_outside_own_clip && self.establishes_fixed_containing_block();
+
         // Call `.hit()` on each child in turn. If any return `Some` then return that value. Else return `Some(self.id).
-        for child_id in self.paint_children.borrow().iter().flatten().rev() {
+        for child_id in self
+            .paint_children
+            .borrow()
+            .iter()
+            .flatten()
+            .rev()
+            .filter(|_| !is_past_containing_clip)
+        {
             if let Some(hit) =
                 self.with(*child_id)
                     .hit_in_clip(x, y, scale, scrollbar, is_clipped_out)
@@ -1472,17 +1489,19 @@ impl Node {
 
     /// Whether this box is the containing block of its `position: fixed` descendants.
     pub fn establishes_fixed_containing_block(&self) -> bool {
-        self.primary_styles()
-            .is_some_and(|style| establishes_fixed_containing_block(&style))
+        establishes_fixed_containing_block(self)
     }
 
-    /// Whether this box clips its overflow itself, as every box does but the root element
-    /// and a `<body>` whose overflow belongs to the viewport.
+    /// Whether this box clips its overflow itself, as paint does: every box with paint
+    /// containment or a non-visible `overflow`, but the root element and a `<body>` whose
+    /// overflow belongs to the viewport.
     pub(crate) fn clips_own_overflow(&self) -> bool {
         let overflow = self.style().overflow;
-        (overflow.x != taffy::Overflow::Visible || overflow.y != taffy::Overflow::Visible)
-            && !self.is_root_element()
-            && !self.is_overflow_propagated_body()
+        let has_clipping_overflow =
+            overflow.x != taffy::Overflow::Visible || overflow.y != taffy::Overflow::Visible;
+        !self.is_root_element()
+            && (applies_paint_containment(self)
+                || (has_clipping_overflow && !self.is_overflow_propagated_body()))
     }
 
     /// Find the inline root ancestor of this node (or self if this is an inline root).
