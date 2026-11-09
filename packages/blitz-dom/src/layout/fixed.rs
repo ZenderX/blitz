@@ -59,7 +59,10 @@ pub(crate) fn establishes_fixed_containing_block(node: &Node) -> bool {
         || will_change.intersects(WillChangeBits::FIXPOS_CB_NON_SVG)
 }
 
-/// Whether `contain: paint` clips this box's contents. Mirrors paint's gate in `render_element`.
+/// Whether `contain: paint` clips this box's contents, per css-contain-2 §3.2. Not the same
+/// test as paint's gate in `render_element`, which excludes only inline-flow boxes (replaced
+/// ones too) and internal table boxes other than a cell, so it also passes inline and
+/// internal ruby boxes and boxes with no principal box.
 pub(crate) fn applies_paint_containment(node: &Node) -> bool {
     node.primary_styles().is_some_and(|style| {
         style.get_box().contain.contains(Contain::PAINT) && applies_containment(node, &style)
