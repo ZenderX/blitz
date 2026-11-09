@@ -1,7 +1,7 @@
 use blitz_traits::node_id::NodeId;
 use std::ops::Range;
 
-use super::fixed::{establishes_fixed_containing_block, is_fixed_positioned};
+use super::fixed::is_fixed_positioned;
 use super::writing_mode;
 use crate::Node;
 use crate::net::ResourceHandler;
@@ -339,8 +339,8 @@ pub struct HoistedPaintChildren {
 
     pub content_area: taffy::Rect<f32>,
 
-    /// Whether a fixed box whose containing block lies above this box paints in this context
-    /// or in one nested in it, so that it can paint past this box's border box.
+    /// Whether a fixed box paints in this context or in one nested in it, under a containing
+    /// block at or above this box, so that it can paint past this box's border box.
     pub has_released_box: bool,
 }
 
@@ -514,7 +514,12 @@ impl BaseDocument {
                     self.place_in_stacking_context(child.node_id, id, child.z_index == 0);
             }
             context.compute_content_size(self);
-            let has_released_child = context.children.iter().any(|c| c.escapes_context_clip);
+            // A fixed box hoisted to its containing block lies past it just as far.
+            let is_containing_block = self.nodes[id].establishes_fixed_containing_block();
+            let has_released_child = context.children.iter().any(|child| {
+                child.escapes_context_clip
+                    || (is_containing_block && is_fixed_positioned(&self.nodes[child.node_id]))
+            });
             self.nodes[id].stacking_context = Some(context);
             if has_released_child {
                 self.mark_released_box(id);
@@ -523,15 +528,17 @@ impl BaseDocument {
     }
 
     /// Record a box released through the stacking context `id` on that context and on each
-    /// context around it, up to the box's containing block.
+    /// context around it, up to and including the box's containing block, whose group layer
+    /// has to reach the box too.
     fn mark_released_box(&mut self, id: NodeId) {
         let mut ancestor = Some(id);
-        while let Some(id) =
-            ancestor.filter(|&id| !self.nodes[id].establishes_fixed_containing_block())
-        {
+        while let Some(id) = ancestor {
             let node = &mut self.nodes[id];
             if let Some(context) = node.stacking_context.as_mut() {
                 context.has_released_box = true;
+            }
+            if node.establishes_fixed_containing_block() {
+                return;
             }
             ancestor = node.layout_parent.get();
         }
@@ -611,7 +618,7 @@ impl BaseDocument {
             return (position != Position::Static || is_flex_or_grid).then_some(z_index);
         }
         let can_hoist = match position {
-            Position::Fixed => hoisting != AutoZHoisting::None,
+            Position::Fixed => true,
             Position::Relative | Position::Absolute | Position::Sticky => {
                 follows_fixed_box && hoisting == AutoZHoisting::All
             }
@@ -831,8 +838,6 @@ impl BaseDocument {
 
             let children_hoisting = match self.nodes[node_id].primary_styles() {
                 _ if parent_stacking_context.is_none() => AutoZHoisting::All,
-                // May not be a stacking context yet, and a box hoisted past it would escape it.
-                Some(style) if establishes_fixed_containing_block(&style) => AutoZHoisting::None,
                 Some(style) if clips_to_rounded_corners(&style) => {
                     hoisting.min(AutoZHoisting::FixedOnly)
                 }
@@ -927,7 +932,6 @@ impl BaseDocument {
 /// Which boxes of `z-index` auto or 0 can be hoisted past a box.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum AutoZHoisting {
-    None,
     /// Only fixed boxes, which a rounded overflow clip below their containing block lets out;
     /// a positioned box needs that clip, whose shape [`HoistedPaintChild::clip`] cannot carry.
     FixedOnly,
@@ -1448,7 +1452,6 @@ mod tests {
     ];
 
     /// A static stacking context sorts at CSS 2.1 Appendix E step 8, not with in-flow content.
-    /// Two resolves, as a `transform` is known to `is_stacking_context_root` from the second.
     #[test]
     fn a_static_stacking_context_paints_above_its_later_in_flow_sibling() {
         for property in EFFECTS
@@ -1462,7 +1465,6 @@ mod tests {
                 &format!("width:100px;height:100px;{property}"),
             );
             let later = append(&mut doc, body, "width:100px;height:100px;margin-top:-50px");
-            doc.resolve(0.0);
             doc.resolve(0.0);
 
             assert_eq!(
@@ -1572,7 +1574,6 @@ mod tests {
 
     /// CSS 2.1 §9.9.1: a box belongs to one stacking context, whatever its containing block,
     /// so a fixed box stays in the group of each of these ancestors and takes its effect.
-    /// Two resolves, as a `transform` is known to `is_stacking_context_root` from the second.
     #[test]
     fn a_fixed_box_paints_inside_the_group_of_an_effect_ancestor() {
         for effect in EFFECTS.iter().chain(&["transform:translate(1px,0)"]) {
@@ -1583,7 +1584,6 @@ mod tests {
                 &format!("width:100px;height:100px;{effect}"),
             );
             let fixed = append(&mut doc, ancestor, FIXED);
-            doc.resolve(0.0);
             doc.resolve(0.0);
 
             assert!(

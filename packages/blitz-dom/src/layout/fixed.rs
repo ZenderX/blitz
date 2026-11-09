@@ -19,37 +19,88 @@
 //! it. Overflow clips it only from its containing block upward (CSS 2.1 §11.1.1).
 
 use crate::layout::inline::layout_abspos_child;
+use crate::layout::replaced::is_replaced_element;
 use crate::node::Node;
 use crate::{BaseDocument, NodeId};
 use style::properties::ComputedValues;
 use style::properties::generated::longhands::position::computed_value::T as Position;
 use style::values::computed::{Perspective, Rotate};
 use style::values::generics::transform::{Scale, Translate};
-use style::values::specified::box_::{Contain, DisplayOutside, WillChangeBits};
+use style::values::specified::box_::{
+    Contain, Display, DisplayInside, DisplayOutside, WillChangeBits,
+};
 
-/// Whether a box of this style is the containing block for its `position: fixed`
-/// descendants: `transform` (or `translate`/`rotate`/`scale`), `perspective`, `filter` or
-/// `backdrop-filter` other than none, `contain: paint | layout | strict | content`, or a
-/// `will-change` naming one.
-pub(crate) fn establishes_fixed_containing_block(style: &ComputedValues) -> bool {
+/// Whether this box is the containing block for its `position: fixed` descendants:
+/// `transform` (or `translate`/`rotate`/`scale`) or `perspective` on a transformable box,
+/// `contain: paint | layout | strict | content` on a box containment applies to, `filter`
+/// or `backdrop-filter` other than none, or a `will-change` naming one. The same gate
+/// makes the box a stacking context (css-contain-2 §3.2, css-transforms-1 §3).
+pub(crate) fn establishes_fixed_containing_block(node: &Node) -> bool {
+    let Some(style) = node.primary_styles() else {
+        return false;
+    };
     let box_style = style.get_box();
     let effects = style.get_effects();
-    !box_style.transform.0.is_empty()
+    let will_change = box_style.will_change.bits;
+    let has_transform_family = !box_style.transform.0.is_empty()
         || !matches!(box_style.translate, Translate::None)
         || !matches!(box_style.rotate, Rotate::None)
         || !matches!(box_style.scale, Scale::None)
         || !matches!(box_style.perspective, Perspective::None)
+        || will_change.intersects(WillChangeBits::TRANSFORM | WillChangeBits::PERSPECTIVE);
+    let has_containment = box_style
+        .contain
+        .intersects(Contain::LAYOUT | Contain::PAINT)
+        || will_change.intersects(WillChangeBits::CONTAIN);
+    (has_transform_family && is_transformable(node, &style))
+        || (has_containment && applies_containment(node, &style))
         || !effects.filter.0.is_empty()
         || !effects.backdrop_filter.0.is_empty()
-        || box_style
-            .contain
-            .intersects(Contain::LAYOUT | Contain::PAINT)
-        || box_style.will_change.bits.intersects(
-            WillChangeBits::TRANSFORM
-                | WillChangeBits::PERSPECTIVE
-                | WillChangeBits::CONTAIN
-                | WillChangeBits::FIXPOS_CB_NON_SVG,
+        || will_change.intersects(WillChangeBits::FIXPOS_CB_NON_SVG)
+}
+
+/// Whether `contain: paint` clips this box's contents. Mirrors paint's gate in `render_element`.
+pub(crate) fn applies_paint_containment(node: &Node) -> bool {
+    node.primary_styles().is_some_and(|style| {
+        style.get_box().contain.contains(Contain::PAINT) && applies_containment(node, &style)
+    })
+}
+
+/// css-transforms-1 "transformable element": every box but a non-replaced inline and a
+/// table column or column group.
+fn is_transformable(node: &Node, style: &ComputedValues) -> bool {
+    let display = style.clone_display();
+    has_principal_box(display)
+        && !is_non_atomic_inline(node, display)
+        && !matches!(
+            display.inside(),
+            DisplayInside::TableColumn | DisplayInside::TableColumnGroup
         )
+}
+
+/// css-contain-2 §3.2: layout and paint containment have no effect on a box with no
+/// principal box, an internal table box other than a cell, an internal ruby box, or a
+/// non-atomic inline.
+fn applies_containment(node: &Node, style: &ComputedValues) -> bool {
+    let display = style.clone_display();
+    let outside = display.outside();
+    has_principal_box(display)
+        && !is_non_atomic_inline(node, display)
+        && outside != DisplayOutside::InternalRuby
+        && (outside != DisplayOutside::InternalTable
+            || display.inside() == DisplayInside::TableCell)
+}
+
+fn has_principal_box(display: Display) -> bool {
+    !display.is_none() && !display.is_contents()
+}
+
+fn is_non_atomic_inline(node: &Node, display: Display) -> bool {
+    display.outside() == DisplayOutside::Inline
+        && matches!(display.inside(), DisplayInside::Flow | DisplayInside::Ruby)
+        && !node
+            .element_data()
+            .is_some_and(|element| is_replaced_element(&element.name.local))
 }
 
 pub(super) fn is_fixed_positioned(node: &Node) -> bool {
@@ -126,10 +177,7 @@ impl BaseDocument {
         let mut current = id;
         while let Some(parent_id) = self.nodes[current].layout_parent.get() {
             let parent = &self.nodes[parent_id];
-            if parent
-                .primary_styles()
-                .is_some_and(|style| establishes_fixed_containing_block(&style))
-            {
+            if establishes_fixed_containing_block(parent) {
                 return scroll;
             }
             scroll.x += parent.scroll_offset().x;
@@ -152,10 +200,7 @@ impl BaseDocument {
         let mut ancestor = self.nodes[id].layout_parent.get();
         while let Some(ancestor_id) = ancestor {
             let node = &self.nodes[ancestor_id];
-            if node
-                .primary_styles()
-                .is_some_and(|style| establishes_fixed_containing_block(&style))
-            {
+            if establishes_fixed_containing_block(node) {
                 return;
             }
             ancestor = node.layout_parent.get();
@@ -194,10 +239,7 @@ impl BaseDocument {
                 break (taffy::Point::ZERO, viewport);
             };
             let candidate = &self.nodes[candidate_id];
-            if candidate
-                .primary_styles()
-                .is_some_and(|style| establishes_fixed_containing_block(&style))
-            {
+            if establishes_fixed_containing_block(candidate) {
                 let layout = candidate.unrounded_layout();
                 let origin = self.unrounded_origin(candidate_id);
                 break (
