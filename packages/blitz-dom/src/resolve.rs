@@ -425,7 +425,11 @@ impl BaseDocument {
 
         taffy::compute_root_layout(self, root_element_id, available_space);
         let scrolled_fixed_boxes = self.layout_fixed_boxes();
-        taffy::round_layout(self, root_element_id);
+        crate::layout::device_grid::round_layout_to_device(
+            self,
+            root_element_id,
+            self.viewport.scale(),
+        );
         self.map_vertical_layouts(self.root_element().id);
         time_pass(&mut timer, Pass::FixedOverflow, || {
             self.scroll_fixed_boxes(&scrolled_fixed_boxes)

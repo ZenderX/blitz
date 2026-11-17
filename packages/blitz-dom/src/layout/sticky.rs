@@ -7,7 +7,7 @@
 //! the one field that painting, hit-testing and `absolute_position` all read, so none of
 //! them know about sticky.
 //!
-//! The in-flow position is never stored: `round_layout` rewrites every `final_layout` from
+//! The in-flow position is never stored: the device-grid rounding rewrites every `final_layout` from
 //! `unrounded_layout` on each `resolve_layout`, so the pass always starts from it and a
 //! scroll, which sets no damage, is picked up by the next `resolve`.
 //!
@@ -19,6 +19,7 @@
 //! The root element's `overflow`, and the `<body>`'s when the root's is `visible`, belongs
 //! to the viewport: neither makes its descendants' scroll container something else.
 
+use crate::layout::device_grid::round_to_device;
 use crate::node::Node;
 use crate::{BaseDocument, NodeId};
 use markup5ever::local_name;
@@ -46,7 +47,7 @@ struct Axis {
 impl Axis {
     /// The distance the box moves along this axis. The end inset applies first, so the
     /// start inset wins when both cannot hold.
-    fn offset(&self) -> f32 {
+    fn offset(&self, scale: f32) -> f32 {
         let mut offset: f32 = 0.0;
         if let Some(inset) = self.inset_end {
             offset = offset.min(self.port_end - inset - (self.start + self.size));
@@ -59,10 +60,8 @@ impl Axis {
         // is not pulled back.
         let room_after = self.container_end - (self.start + self.size + self.margin_end);
         let room_before = self.container_start - (self.start - self.margin_start);
-        offset
-            .min(room_after.max(0.0))
-            .max(room_before.min(0.0))
-            .round()
+        let offset = offset.min(room_after.max(0.0)).max(room_before.min(0.0));
+        round_to_device(offset, scale)
     }
 }
 
@@ -166,6 +165,7 @@ impl BaseDocument {
 
         let viewport = self.stylist.device().au_viewport_size();
         let (port_width, port_height) = (viewport.width.to_f32_px(), viewport.height.to_f32_px());
+        let scale = self.viewport.scale();
         let scroll = self.viewport_scroll();
         let (port_left, port_top) = (scroll.x as f32, scroll.y as f32);
 
@@ -229,8 +229,8 @@ impl BaseDocument {
         };
 
         let shift = taffy::Point {
-            x: horizontal.offset(),
-            y: vertical.offset(),
+            x: horizontal.offset(scale),
+            y: vertical.offset(scale),
         };
         let location = &mut self.nodes[id].final_layout_mut().location;
         location.x += shift.x;

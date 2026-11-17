@@ -22,6 +22,7 @@ pub(crate) mod construct;
 pub(crate) mod counter_style;
 pub(crate) mod counters;
 pub(crate) mod damage;
+pub(crate) mod device_grid;
 pub(crate) mod emphasis;
 pub(crate) mod first_line;
 pub(crate) mod fixed;
